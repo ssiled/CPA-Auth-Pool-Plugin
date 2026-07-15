@@ -1,0 +1,105 @@
+﻿name: Publish CPA Auth Pool Plugin
+
+on:
+  push:
+    tags:
+      - 'cpa-auth-pool-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            cc: gcc
+            packages: gcc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install CGO toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }} zip
+
+      - name: Build plugin
+        id: build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          version="${GITHUB_REF_NAME#cpa-auth-pool-v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="0.1.0"
+          fi
+
+          package_dir="$RUNNER_TEMP/cpa-auth-pool-package"
+          rm -rf "$package_dir" release
+          mkdir -p "$package_dir" release
+
+          (
+            cd .
+            CGO_ENABLED=1 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -buildmode=c-shared -trimpath -ldflags="-s -w" \
+                -o "$package_dir/cpa-auth-pool.so" ./cmd/cpa-auth-pool
+          )
+
+          cp README.md "$package_dir/README.md"
+          asset_name="cpa-auth-pool_${version}_${GOOS}_${GOARCH}.zip"
+          (cd "$package_dir" && zip -9 -q "$GITHUB_WORKSPACE/release/$asset_name" cpa-auth-pool.so README.md)
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cpa-auth-pool-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release/${{ steps.build.outputs.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish plugin release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_type == 'tag'
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: cpa-auth-pool-*
+          merge-multiple: true
+          path: release
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          (cd release && sha256sum *.zip > checksums.txt)
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --target "$GITHUB_SHA" \
+            --title "CPA Auth Pool ${GITHUB_REF_NAME#cpa-auth-pool-v}" \
+            --notes "CPA scheduler plugin for binding API keys to auth pools. Add https://raw.githubusercontent.com/ssiled/-CPA-Auth-Pool-Plugin/main/registry.json to plugins.store-sources."
+

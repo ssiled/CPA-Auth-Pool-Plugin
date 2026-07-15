@@ -1,0 +1,128 @@
+package plugin
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/url"
+)
+
+const (
+	ABIVersion    = 1
+	SchemaVersion = 1
+	PluginID      = "cpa-auth-pool"
+	PluginName    = "CPA Auth Pool"
+	Version       = "0.1.0"
+
+	MethodPluginRegister     = "plugin.register"
+	MethodPluginReconfigure  = "plugin.reconfigure"
+	MethodSchedulerPick      = "scheduler.pick"
+	MethodManagementRegister = "management.register"
+	MethodManagementHandle   = "management.handle"
+)
+
+type Envelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *EnvelopeError  `json:"error,omitempty"`
+}
+
+type EnvelopeError struct {
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+}
+
+type LifecycleRequest struct {
+	ConfigYAML string `json:"ConfigYAML"`
+}
+
+type Registration struct {
+	SchemaVersion uint32       `json:"schema_version"`
+	Metadata      Metadata     `json:"metadata"`
+	Capabilities  Capabilities `json:"capabilities"`
+}
+
+type Metadata struct {
+	Name         string        `json:"Name"`
+	Version      string        `json:"Version"`
+	Author       string        `json:"Author"`
+	ConfigFields []ConfigField `json:"ConfigFields"`
+}
+
+type ConfigField struct {
+	Name        string `json:"Name"`
+	Type        string `json:"Type"`
+	Description string `json:"Description"`
+}
+
+type Capabilities struct {
+	Scheduler     bool `json:"scheduler,omitempty"`
+	ManagementAPI bool `json:"management_api"`
+}
+
+type SchedulerPickRequest struct {
+	Provider   string                   `json:"Provider,omitempty"`
+	Model      string                   `json:"Model"`
+	Options    SchedulerPickOptions     `json:"Options"`
+	Candidates []SchedulerAuthCandidate `json:"Candidates"`
+}
+
+type SchedulerPickOptions struct {
+	Headers  map[string][]string `json:"Headers,omitempty"`
+	Metadata map[string]any      `json:"Metadata,omitempty"`
+}
+
+type SchedulerAuthCandidate struct {
+	ID         string            `json:"ID"`
+	Provider   string            `json:"Provider"`
+	Priority   int               `json:"Priority,omitempty"`
+	Status     string            `json:"Status,omitempty"`
+	Attributes map[string]string `json:"Attributes,omitempty"`
+	Metadata   map[string]any    `json:"Metadata,omitempty"`
+}
+
+type SchedulerPickResponse struct {
+	AuthID  string `json:"AuthID,omitempty"`
+	Handled bool   `json:"Handled"`
+}
+
+type ManagementRegistrationRequest struct {
+	BasePath string `json:"BasePath"`
+}
+
+type ManagementRegistrationResponse struct {
+	Routes []ManagementRoute `json:"Routes"`
+}
+
+type ManagementRoute struct {
+	Method      string `json:"Method"`
+	Path        string `json:"Path"`
+	Description string `json:"Description,omitempty"`
+}
+
+type ManagementRequest struct {
+	Method  string      `json:"Method"`
+	Path    string      `json:"Path"`
+	Headers http.Header `json:"Headers"`
+	Query   url.Values  `json:"Query"`
+	Body    []byte      `json:"Body"`
+}
+
+type ManagementResponse struct {
+	StatusCode int         `json:"StatusCode,omitempty"`
+	Headers    http.Header `json:"Headers,omitempty"`
+	Body       []byte      `json:"Body,omitempty"`
+}
+
+func OKEnvelope(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(Envelope{OK: true, Result: raw})
+}
+
+func ErrorEnvelope(code, message string, status int) []byte {
+	raw, _ := json.Marshal(Envelope{OK: false, Error: &EnvelopeError{Code: code, Message: message, HTTPStatus: status}})
+	return raw
+}
