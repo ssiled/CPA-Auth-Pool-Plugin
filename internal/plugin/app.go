@@ -25,11 +25,12 @@ type State struct {
 }
 
 type PoolConfig struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	AuthIDs     []string `json:"auth_ids"`
-	Enabled     bool     `json:"enabled"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Description  string   `json:"description,omitempty"`
+	AuthIDs      []string `json:"auth_ids"`
+	AccountTypes []string `json:"account_types,omitempty"`
+	Enabled      bool     `json:"enabled"`
 }
 
 type KeyBinding struct {
@@ -122,11 +123,23 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
 	for _, id := range pool.AuthIDs {
-		allowed[id] = struct{}{}
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	allowedTypes := make(map[string]struct{}, len(pool.AccountTypes))
+	for _, accountType := range pool.AccountTypes {
+		if accountType = strings.ToLower(strings.TrimSpace(accountType)); accountType != "" {
+			allowedTypes[accountType] = struct{}{}
+		}
 	}
 	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	for _, candidate := range req.Candidates {
 		if _, ok := allowed[candidate.ID]; ok {
+			matched = append(matched, candidate)
+			continue
+		}
+		if _, ok := allowedTypes[candidateAccountType(candidate)]; ok {
 			matched = append(matched, candidate)
 		}
 	}
@@ -140,6 +153,18 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return matched[i].Priority > matched[j].Priority
 	})
 	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: matched[0].ID})
+}
+
+func candidateAccountType(candidate SchedulerAuthCandidate) string {
+	if candidate.Attributes == nil {
+		return "supported"
+	}
+	for _, key := range []string{"account_type", "plan_type", "tier", "chatgpt_plan_type", "chatgptPlanType", "planType"} {
+		if value := strings.ToLower(strings.TrimSpace(candidate.Attributes[key])); value != "" {
+			return value
+		}
+	}
+	return "supported"
 }
 
 func (a *App) poolLocked(id string) (PoolConfig, bool) {

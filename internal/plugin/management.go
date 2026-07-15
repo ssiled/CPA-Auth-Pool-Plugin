@@ -68,6 +68,8 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	}
 	pool.ID = strings.TrimSpace(pool.ID)
 	pool.Name = strings.TrimSpace(pool.Name)
+	pool.AuthIDs = cleanStringList(pool.AuthIDs)
+	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
 	if pool.ID == "" || pool.Name == "" {
 		return jsonError(http.StatusBadRequest, "invalid_pool", "id and name are required")
 	}
@@ -168,6 +170,40 @@ func hashFromRequest(req ManagementRequest) string {
 	var body map[string]string
 	_ = json.Unmarshal(req.Body, &body)
 	return body["api_key_hash"]
+}
+
+func cleanStringList(values []string) []string {
+	seen := map[string]struct{}{}
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func cleanLowerStringList(values []string) []string {
+	seen := map[string]struct{}{}
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
 }
 
 func jsonResponse(status int, body any) ManagementResponse {
