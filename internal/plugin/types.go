@@ -10,8 +10,8 @@ const (
 	ABIVersion    = 1
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
-	PluginName    = "CPA Auth Pool"
-	Version       = "0.1.0"
+	PluginName    = "cpa-auth-pool"
+	Version       = "0.1.8"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
@@ -33,7 +33,7 @@ type EnvelopeError struct {
 }
 
 type LifecycleRequest struct {
-	ConfigYAML string `json:"ConfigYAML"`
+	ConfigYAML []byte `json:"config_yaml"`
 }
 
 type Registration struct {
@@ -43,10 +43,11 @@ type Registration struct {
 }
 
 type Metadata struct {
-	Name         string        `json:"Name"`
-	Version      string        `json:"Version"`
-	Author       string        `json:"Author"`
-	ConfigFields []ConfigField `json:"ConfigFields"`
+	Name             string        `json:"Name"`
+	Version          string        `json:"Version"`
+	Author           string        `json:"Author"`
+	GitHubRepository string        `json:"GitHubRepository,omitempty"`
+	ConfigFields     []ConfigField `json:"ConfigFields"`
 }
 
 type ConfigField struct {

@@ -69,8 +69,8 @@ func (a *App) configure(raw []byte) error {
 	stateFile := "cpa-auth-pool-state.json"
 	if len(raw) > 0 {
 		var req LifecycleRequest
-		if err := json.Unmarshal(raw, &req); err == nil && strings.Contains(req.ConfigYAML, "state_file") {
-			for _, line := range strings.Split(req.ConfigYAML, "\n") {
+		if err := json.Unmarshal(raw, &req); err == nil && strings.Contains(string(req.ConfigYAML), "state_file") {
+			for _, line := range strings.Split(string(req.ConfigYAML), "\n") {
 				parts := strings.SplitN(line, ":", 2)
 				if len(parts) == 2 && strings.TrimSpace(parts[0]) == "state_file" {
 					stateFile = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
@@ -88,9 +88,10 @@ func (a *App) registration() Registration {
 	return Registration{
 		SchemaVersion: SchemaVersion,
 		Metadata: Metadata{
-			Name:    PluginName,
-			Version: Version,
-			Author:  "CPA-Helper-s",
+			Name:             PluginName,
+			Version:          Version,
+			Author:           "CPA-Helper-s",
+			GitHubRepository: "https://github.com/ssiled/-CPA-Auth-Pool-Plugin",
 			ConfigFields: []ConfigField{
 				{Name: "state_file", Type: "string", Description: "JSON state file used for auth pools and API key bindings."},
 			},

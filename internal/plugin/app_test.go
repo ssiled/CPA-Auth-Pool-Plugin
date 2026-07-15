@@ -2,8 +2,37 @@ package plugin
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 )
+
+func TestPluginRegistrationUsesConfiguredPluginID(t *testing.T) {
+	app := NewApp()
+	registration := app.registration()
+
+	if registration.Metadata.Name != PluginID {
+		t.Fatalf("registration name = %q, want %q", registration.Metadata.Name, PluginID)
+	}
+	if registration.Metadata.Version != Version {
+		t.Fatalf("registration version = %q, want %q", registration.Metadata.Version, Version)
+	}
+	if !registration.Capabilities.Scheduler || !registration.Capabilities.ManagementAPI {
+		t.Fatalf("registration capabilities = %+v, want scheduler and management_api", registration.Capabilities)
+	}
+}
+
+func TestConfigureReadsHostConfigYAML(t *testing.T) {
+	app := NewApp()
+	stateFile := filepath.Join(t.TempDir(), "auth-pool-state.json")
+	rawReq, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("state_file: " + stateFile + "\n")})
+
+	if err := app.configure(rawReq); err != nil {
+		t.Fatalf("configure failed: %v", err)
+	}
+	if app.stateFile != stateFile {
+		t.Fatalf("stateFile = %q, want %q", app.stateFile, stateFile)
+	}
+}
 
 func decodeSchedulerResponse(t *testing.T, raw []byte) SchedulerPickResponse {
 	t.Helper()
