@@ -113,8 +113,11 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	binding, ok := a.state.KeyBindings[apiKeyHash]
 	pool, poolOK := a.poolLocked(binding.PoolID)
 	a.mu.RUnlock()
-	if !ok || !poolOK || !pool.Enabled {
+	if !ok {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
+	}
+	if !poolOK || !pool.Enabled {
+		return OKEnvelope(SchedulerPickResponse{Handled: true})
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
 	for _, id := range pool.AuthIDs {

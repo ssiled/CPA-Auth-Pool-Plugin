@@ -67,3 +67,46 @@ func TestSchedulerDoesNotFallbackWhenPoolEmpty(t *testing.T) {
 		t.Fatalf("response = %+v, want handled empty AuthID", resp)
 	}
 }
+
+func TestSchedulerDoesNotFallbackWhenPoolMissing(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-missing-pool"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "missing-pool"}}
+
+	req := SchedulerPickRequest{
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Priority: 100}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "" {
+		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	}
+}
+
+func TestSchedulerDoesNotFallbackWhenPoolDisabled(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-disabled-pool"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: false, AuthIDs: []string{"auth-a"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-a"}}
+
+	req := SchedulerPickRequest{
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Priority: 100}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "" {
+		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	}
+}
