@@ -1,4 +1,4 @@
-﻿name: Publish CPA Auth Pool Plugin
+name: Publish CPA Auth Pool Plugin
 
 on:
   push:

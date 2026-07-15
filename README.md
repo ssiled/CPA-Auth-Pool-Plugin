@@ -1,4 +1,4 @@
-﻿# CPA Auth Pool Plugin
+# CPA Auth Pool Plugin
 
 `cpa-auth-pool` is a CPA scheduler plugin shipped with CPA-Helper-s. It groups CPA auth accounts into pools and lets each CPA-Helper-s API key bind to one pool.
 
