@@ -94,6 +94,7 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 func TestSchedulerUsesHelperAPIKeyHashHeader(t *testing.T) {
 	app := NewApp()
 	helperKeyHash := hashAPIKey("sk-helper-local")
+	app.state.ProxyKeyHashes = []string{hashAPIKey("sk-cpa-upstream")}
 	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-b"}}}
 	app.state.KeyBindings = map[string]KeyBinding{helperKeyHash: {APIKeyHash: helperKeyHash, PoolID: "pool-a"}}
 
@@ -112,6 +113,30 @@ func TestSchedulerUsesHelperAPIKeyHashHeader(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "auth-b" {
 		t.Fatalf("response = %+v, want auth-b selected by helper hash", resp)
+	}
+}
+
+func TestSchedulerIgnoresHelperAPIKeyHashWithoutTrustedProxyKey(t *testing.T) {
+	app := NewApp()
+	helperKeyHash := hashAPIKey("sk-helper-local")
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-b"}}}
+	app.state.KeyBindings = map[string]KeyBinding{helperKeyHash: {APIKeyHash: helperKeyHash, PoolID: "pool-a"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{
+			"Authorization":        {"Bearer sk-cpa-upstream"},
+			helperAPIKeyHashHeader: {helperKeyHash},
+		}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Priority: 100}, {ID: "auth-b", Priority: 1}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if resp.Handled {
+		t.Fatalf("response = %+v, want unhandled untrusted helper hash", resp)
 	}
 }
 
@@ -301,6 +326,7 @@ func TestModelsEndpointFiltersToBoundPoolModels(t *testing.T) {
 func TestModelsEndpointUsesHelperAPIKeyHashHeader(t *testing.T) {
 	app := NewApp()
 	helperKeyHash := hashAPIKey("sk-helper-local")
+	app.state.ProxyKeyHashes = []string{hashAPIKey("sk-cpa-upstream")}
 	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-a"}}}
 	app.state.KeyBindings = map[string]KeyBinding{helperKeyHash: {APIKeyHash: helperKeyHash, PoolID: "pool-a"}}
 

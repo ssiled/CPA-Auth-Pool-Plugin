@@ -342,9 +342,6 @@ func (a *App) isTrustedProxyAPIKey(apiKey string) bool {
 	apiKeyHash := hashAPIKey(apiKey)
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if len(a.state.ProxyKeyHashes) == 0 {
-		return true
-	}
 	for _, trusted := range a.state.ProxyKeyHashes {
 		if strings.EqualFold(strings.TrimSpace(trusted), apiKeyHash) {
 			return true
