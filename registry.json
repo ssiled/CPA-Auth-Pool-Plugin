@@ -7,8 +7,8 @@
       "description": "Bind CPA-Helper-s API keys to CPA auth pools and schedule requests only within the selected pool.",
       "author": "ssiled",
       "version": "0.1.10",
-      "repository": "https://github.com/ssiled/-CPA-Auth-Pool-Plugin",
-      "homepage": "https://github.com/ssiled/-CPA-Auth-Pool-Plugin/blob/main/README.md",
+      "repository": "https://github.com/ssiled/CPA-Auth-Pool-Plugin",
+      "homepage": "https://github.com/ssiled/CPA-Auth-Pool-Plugin/blob/main/README.md",
       "license": "MIT",
       "tags": [
         "Scheduler",

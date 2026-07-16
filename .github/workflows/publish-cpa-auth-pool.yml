@@ -101,5 +101,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release/* \
             --target "$GITHUB_SHA" \
             --title "CPA Auth Pool ${GITHUB_REF_NAME#v}" \
-            --notes "CPA scheduler plugin for binding API keys to auth pools. Add https://raw.githubusercontent.com/ssiled/-CPA-Auth-Pool-Plugin/main/registry.json to plugins.store-sources."
+            --notes "CPA scheduler plugin for binding API keys to auth pools. Add https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json to plugins.store-sources."
 

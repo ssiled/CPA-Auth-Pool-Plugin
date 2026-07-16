@@ -65,7 +65,7 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 ## Plugin Store URL
 
 `	ext
-https://raw.githubusercontent.com/ssiled/-CPA-Auth-Pool-Plugin/main/registry.json
+https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json
 ` 
 
 
