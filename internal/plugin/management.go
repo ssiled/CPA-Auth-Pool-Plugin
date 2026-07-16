@@ -135,6 +135,7 @@ func (a *App) deletePool(id string) ManagementResponse {
 
 type authModelsPayload struct {
 	AuthModels map[string][]string `json:"auth_models"`
+	PoolModels map[string][]string `json:"pool_models"`
 }
 
 func (a *App) syncAuthModels(body []byte) ManagementResponse {
@@ -150,9 +151,21 @@ func (a *App) syncAuthModels(body []byte) ManagementResponse {
 		}
 		next[authID] = cleanModelList(models)
 	}
+	nextPoolModels := make(map[string][]string, len(payload.PoolModels))
+	for poolID, models := range payload.PoolModels {
+		poolID = strings.TrimSpace(poolID)
+		if poolID == "" {
+			continue
+		}
+		nextPoolModels[poolID] = cleanModelList(models)
+	}
 	a.mu.Lock()
 	a.state.AuthModels = next
 	for i := range a.state.Pools {
+		if models, ok := nextPoolModels[a.state.Pools[i].ID]; ok {
+			a.state.Pools[i].Models = models
+			continue
+		}
 		a.state.Pools[i].Models = cleanModelList(poolModelListFromAuthModels(a.state.Pools[i].AuthIDs, next))
 	}
 	a.mu.Unlock()

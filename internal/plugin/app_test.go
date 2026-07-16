@@ -266,3 +266,20 @@ func TestModelsEndpointFailsClosedWhenPoolHasNoModels(t *testing.T) {
 		t.Fatalf("filtered payload = %s, want no available models", resp.Body)
 	}
 }
+
+func TestSyncAuthModelsAcceptsPoolModels(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "auth-pool-state.json")
+	app.state.Pools = []PoolConfig{{ID: "pool-type", Name: "Pool Type", Enabled: true, AccountTypes: []string{"plus"}}}
+
+	resp := app.syncAuthModels([]byte(`{
+		"auth_models":{"auth-a":["gpt-a"]},
+		"pool_models":{"pool-type":["gpt-type"]}
+	}`))
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if len(app.state.Pools[0].Models) != 1 || app.state.Pools[0].Models[0] != "gpt-type" {
+		t.Fatalf("pool models = %#v, want gpt-type", app.state.Pools[0].Models)
+	}
+}
