@@ -91,6 +91,30 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	}
 }
 
+func TestSchedulerUsesHelperAPIKeyHashHeader(t *testing.T) {
+	app := NewApp()
+	helperKeyHash := hashAPIKey("sk-helper-local")
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-b"}}}
+	app.state.KeyBindings = map[string]KeyBinding{helperKeyHash: {APIKeyHash: helperKeyHash, PoolID: "pool-a"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{
+			"Authorization":        {"Bearer sk-cpa-upstream"},
+			helperAPIKeyHashHeader: {helperKeyHash},
+		}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Priority: 100}, {ID: "auth-b", Priority: 1}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "auth-b" {
+		t.Fatalf("response = %+v, want auth-b selected by helper hash", resp)
+	}
+}
+
 func TestSchedulerMatchesDynamicAccountType(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-type"
@@ -113,6 +137,43 @@ func TestSchedulerMatchesDynamicAccountType(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "codex-plus-new.json" {
 		t.Fatalf("response = %+v, want dynamically matched plus account", resp)
+	}
+}
+
+func TestSchedulerMatchesGeminiAndGrokAccountTypes(t *testing.T) {
+	tests := []struct {
+		name       string
+		poolType   string
+		candidate  SchedulerAuthCandidate
+		wantAuthID string
+	}{
+		{name: "gemini provider", poolType: "gemini", candidate: SchedulerAuthCandidate{ID: "google-oauth.json", Provider: "google", Priority: 1}, wantAuthID: "google-oauth.json"},
+		{name: "grok id", poolType: "grok", candidate: SchedulerAuthCandidate{ID: "xai-grok-key.json", Provider: "openai-compatible", Priority: 1}, wantAuthID: "xai-grok-key.json"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app := NewApp()
+			apiKey := "sk-" + test.poolType
+			apiKeyHash := hashAPIKey(apiKey)
+			app.state.Pools = []PoolConfig{{ID: "pool-" + test.poolType, Name: test.poolType, Enabled: true, AccountTypes: []string{test.poolType}}}
+			app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-" + test.poolType}}
+			req := SchedulerPickRequest{
+				Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+				Candidates: []SchedulerAuthCandidate{
+					{ID: "codex-free.json", Provider: "codex", Priority: 100},
+					test.candidate,
+				},
+			}
+			rawReq, _ := json.Marshal(req)
+			raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := decodeSchedulerResponse(t, raw)
+			if !resp.Handled || resp.AuthID != test.wantAuthID {
+				t.Fatalf("response = %+v, want %s", resp, test.wantAuthID)
+			}
+		})
 	}
 }
 
@@ -234,6 +295,38 @@ func TestModelsEndpointFiltersToBoundPoolModels(t *testing.T) {
 	}
 	if len(payload.Data) != 1 || payload.Data[0]["id"] != "gpt-a" {
 		t.Fatalf("filtered payload = %s, want only gpt-a", resp.Body)
+	}
+}
+
+func TestModelsEndpointUsesHelperAPIKeyHashHeader(t *testing.T) {
+	app := NewApp()
+	helperKeyHash := hashAPIKey("sk-helper-local")
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-a"}}}
+	app.state.KeyBindings = map[string]KeyBinding{helperKeyHash: {APIKeyHash: helperKeyHash, PoolID: "pool-a"}}
+
+	body := []byte(`{"object":"list","data":[{"id":"gpt-a","object":"model"},{"id":"gpt-b","object":"model"}]}`)
+	req, _ := json.Marshal(ResponseInterceptRequest{
+		Path:       "/v1/models",
+		StatusCode: 200,
+		RequestHeaders: map[string][]string{
+			"Authorization":        {"Bearer sk-cpa-upstream"},
+			helperAPIKeyHashHeader: {helperKeyHash},
+		},
+		Body: body,
+	})
+	raw, err := app.HandleMethod(MethodResponseIntercept, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeInterceptResponse(t, raw)
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 1 || payload.Data[0]["id"] != "gpt-a" {
+		t.Fatalf("filtered payload = %s, want only gpt-a selected by helper hash", resp.Body)
 	}
 }
 

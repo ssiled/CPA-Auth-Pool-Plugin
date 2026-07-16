@@ -17,10 +17,16 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 		return OKEnvelope(ResponseInterceptResponse{})
 	}
 	apiKey := extractAPIKeyFromHTTPHeader(req.RequestHeaders)
-	if apiKey == "" {
+	apiKeyHash := extractHelperAPIKeyHashFromHTTPHeader(req.RequestHeaders)
+	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
 		return OKEnvelope(ResponseInterceptResponse{})
 	}
-	apiKeyHash := hashAPIKey(apiKey)
+	if apiKeyHash == "" && apiKey != "" {
+		apiKeyHash = hashAPIKey(apiKey)
+	}
+	if apiKeyHash == "" {
+		return OKEnvelope(ResponseInterceptResponse{})
+	}
 
 	a.mu.RLock()
 	binding, ok := a.state.KeyBindings[apiKeyHash]
@@ -171,6 +177,11 @@ func modelIDFromItem(item any) string {
 func extractAPIKeyFromHTTPHeader(headers http.Header) string {
 	flat := map[string][]string(headers)
 	return extractAPIKey(flat)
+}
+
+func extractHelperAPIKeyHashFromHTTPHeader(headers http.Header) string {
+	flat := map[string][]string(headers)
+	return extractHelperAPIKeyHash(flat)
 }
 
 func jsonHeaders() http.Header {

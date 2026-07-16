@@ -19,10 +19,13 @@ type App struct {
 	stateFile string
 }
 
+const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
+
 type State struct {
-	Pools       []PoolConfig          `json:"pools"`
-	KeyBindings map[string]KeyBinding `json:"key_bindings"`
-	AuthModels  map[string][]string   `json:"auth_models,omitempty"`
+	Pools          []PoolConfig          `json:"pools"`
+	KeyBindings    map[string]KeyBinding `json:"key_bindings"`
+	AuthModels     map[string][]string   `json:"auth_models,omitempty"`
+	ProxyKeyHashes []string              `json:"proxy_key_hashes,omitempty"`
 }
 
 type PoolConfig struct {
@@ -43,7 +46,7 @@ type KeyBinding struct {
 }
 
 func NewApp() *App {
-	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}}}
+	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}}}
 }
 
 func (a *App) Shutdown() {
@@ -111,10 +114,16 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	apiKey := extractAPIKey(req.Options.Headers)
-	if apiKey == "" {
+	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
+	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
-	apiKeyHash := hashAPIKey(apiKey)
+	if apiKeyHash == "" && apiKey != "" {
+		apiKeyHash = hashAPIKey(apiKey)
+	}
+	if apiKeyHash == "" {
+		return OKEnvelope(SchedulerPickResponse{Handled: false})
+	}
 	a.mu.RLock()
 	binding, ok := a.state.KeyBindings[apiKeyHash]
 	pool, poolOK := a.poolLocked(binding.PoolID)
@@ -139,7 +148,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	allowedTypes := make(map[string]struct{}, len(pool.AccountTypes))
 	for _, accountType := range pool.AccountTypes {
-		if accountType = strings.ToLower(strings.TrimSpace(accountType)); accountType != "" {
+		if accountType = normalizeAccountType(accountType); accountType != "" {
 			allowedTypes[accountType] = struct{}{}
 		}
 	}
@@ -149,8 +158,11 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 			matched = append(matched, candidate)
 			continue
 		}
-		if _, ok := allowedTypes[candidateAccountType(candidate)]; ok {
-			matched = append(matched, candidate)
+		for _, candidateType := range candidateAccountTypes(candidate) {
+			if _, ok := allowedTypes[candidateType]; ok {
+				matched = append(matched, candidate)
+				break
+			}
 		}
 	}
 	if len(matched) == 0 {
@@ -165,16 +177,67 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: matched[0].ID})
 }
 
-func candidateAccountType(candidate SchedulerAuthCandidate) string {
-	if candidate.Attributes == nil {
-		return "supported"
-	}
-	for _, key := range []string{"account_type", "plan_type", "tier", "chatgpt_plan_type", "chatgptPlanType", "planType"} {
-		if value := strings.ToLower(strings.TrimSpace(candidate.Attributes[key])); value != "" {
-			return value
+func candidateAccountTypes(candidate SchedulerAuthCandidate) []string {
+	seen := map[string]bool{}
+	values := []string{}
+	add := func(value string) {
+		for _, normalized := range accountTypeAliases(value) {
+			if normalized == "" || seen[normalized] {
+				continue
+			}
+			seen[normalized] = true
+			values = append(values, normalized)
 		}
 	}
-	return "supported"
+	add(candidate.Provider)
+	add(candidate.ID)
+	for _, key := range []string{"account_type", "accountType", "plan_type", "tier", "chatgpt_plan_type", "chatgptPlanType", "planType", "provider", "type", "kind", "service", "source"} {
+		if candidate.Attributes != nil {
+			add(candidate.Attributes[key])
+		}
+		if candidate.Metadata != nil {
+			if text, ok := candidate.Metadata[key].(string); ok {
+				add(text)
+			}
+		}
+	}
+	if len(values) == 0 {
+		values = append(values, "supported")
+	}
+	return values
+}
+
+func accountTypeAliases(value string) []string {
+	normalized := normalizeAccountType(value)
+	if normalized == "" {
+		return nil
+	}
+	aliases := []string{normalized}
+	switch {
+	case strings.Contains(normalized, "gemini") || strings.Contains(normalized, "google"):
+		aliases = append(aliases, "gemini")
+	case strings.Contains(normalized, "grok") || strings.Contains(normalized, "xai") || strings.Contains(normalized, "x_ai"):
+		aliases = append(aliases, "grok")
+	case strings.Contains(normalized, "claude") || strings.Contains(normalized, "anthropic"):
+		aliases = append(aliases, "claude")
+	case strings.Contains(normalized, "codex") || strings.Contains(normalized, "openai"):
+		aliases = append(aliases, "codex")
+	}
+	return aliases
+}
+
+func normalizeAccountType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("-", "_", " ", "_", ".", "_", "@", "_", "/", "_", "\\", "_").Replace(value)
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == '_' })
+	cleaned := []string{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			cleaned = append(cleaned, part)
+		}
+	}
+	return strings.Join(cleaned, "_")
 }
 
 func (a *App) poolLocked(id string) (PoolConfig, bool) {
@@ -212,6 +275,9 @@ func (a *App) load() error {
 	}
 	if state.AuthModels == nil {
 		state.AuthModels = map[string][]string{}
+	}
+	if state.ProxyKeyHashes == nil {
+		state.ProxyKeyHashes = []string{}
 	}
 	a.state = state
 	return nil
@@ -256,4 +322,33 @@ func extractAPIKey(headers map[string][]string) string {
 		}
 	}
 	return ""
+}
+
+func extractHelperAPIKeyHash(headers map[string][]string) string {
+	for name, values := range headers {
+		if len(values) == 0 || !strings.EqualFold(name, helperAPIKeyHashHeader) {
+			continue
+		}
+		return strings.ToLower(strings.TrimSpace(values[0]))
+	}
+	return ""
+}
+
+func (a *App) isTrustedProxyAPIKey(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	apiKeyHash := hashAPIKey(apiKey)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.state.ProxyKeyHashes) == 0 {
+		return true
+	}
+	for _, trusted := range a.state.ProxyKeyHashes {
+		if strings.EqualFold(strings.TrimSpace(trusted), apiKeyHash) {
+			return true
+		}
+	}
+	return false
 }

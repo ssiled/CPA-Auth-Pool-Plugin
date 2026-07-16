@@ -14,6 +14,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		{Method: http.MethodPost, Path: base + "/pools", Description: "Create or update an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/pools", Description: "Delete an auth pool."},
 		{Method: http.MethodPost, Path: base + "/auth-models", Description: "Sync per-auth model catalogs used to filter /v1/models."},
+		{Method: http.MethodPost, Path: base + "/proxy-keys", Description: "Register trusted CPA API keys used by CPA-Helper forwarding."},
 		{Method: http.MethodGet, Path: base + "/bindings", Description: "List API key to pool bindings."},
 		{Method: http.MethodPost, Path: base + "/bindings", Description: "Bind an API key hash to an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/bindings", Description: "Remove an API key binding."},
@@ -38,6 +39,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.deletePool(idFromRequest(req)))
 	case req.Method == http.MethodPost && path == base+"/auth-models":
 		return OKEnvelope(a.syncAuthModels(req.Body))
+	case req.Method == http.MethodPost && path == base+"/proxy-keys":
+		return OKEnvelope(a.upsertProxyKeys(req.Body))
 	case req.Method == http.MethodGet && path == base+"/bindings":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"bindings": a.snapshot().Bindings}))
 	case req.Method == http.MethodPost && path == base+"/bindings":
@@ -53,6 +56,7 @@ type statusSnapshot struct {
 	Pools      []PoolConfig        `json:"pools"`
 	Bindings   []KeyBinding        `json:"bindings"`
 	AuthModels map[string][]string `json:"auth_models,omitempty"`
+	ProxyKeyCount int              `json:"proxy_key_count"`
 }
 
 func (a *App) snapshot() statusSnapshot {
@@ -66,7 +70,7 @@ func (a *App) snapshot() statusSnapshot {
 	for authID, models := range a.state.AuthModels {
 		authModels[authID] = append([]string(nil), models...)
 	}
-	return statusSnapshot{Pools: append([]PoolConfig(nil), a.state.Pools...), Bindings: bindings, AuthModels: authModels}
+	return statusSnapshot{Pools: append([]PoolConfig(nil), a.state.Pools...), Bindings: bindings, AuthModels: authModels, ProxyKeyCount: len(a.state.ProxyKeyHashes)}
 }
 
 func (a *App) upsertPool(body []byte) ManagementResponse {
@@ -181,6 +185,51 @@ func poolModelListFromAuthModels(authIDs []string, authModels map[string][]strin
 		models = append(models, authModels[strings.TrimSpace(authID)]...)
 	}
 	return models
+}
+
+type proxyKeysPayload struct {
+	APIKeys []string `json:"api_keys"`
+	APIKey  string   `json:"api_key"`
+}
+
+func (a *App) upsertProxyKeys(body []byte) ManagementResponse {
+	var payload proxyKeysPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	keys := append([]string(nil), payload.APIKeys...)
+	if strings.TrimSpace(payload.APIKey) != "" {
+		keys = append(keys, payload.APIKey)
+	}
+	hashes := cleanAPIKeyHashes(keys)
+	if len(hashes) == 0 {
+		return jsonError(http.StatusBadRequest, "missing_api_key", "api_key is required")
+	}
+	a.mu.Lock()
+	a.state.ProxyKeyHashes = hashes
+	a.mu.Unlock()
+	if err := a.save(); err != nil {
+		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"proxy_key_count": len(hashes)})
+}
+
+func cleanAPIKeyHashes(keys []string) []string {
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		hash := hashAPIKey(key)
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		result = append(result, hash)
+	}
+	return result
 }
 
 func (a *App) upsertBinding(body []byte) ManagementResponse {
