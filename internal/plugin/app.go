@@ -22,6 +22,7 @@ type App struct {
 type State struct {
 	Pools       []PoolConfig          `json:"pools"`
 	KeyBindings map[string]KeyBinding `json:"key_bindings"`
+	AuthModels  map[string][]string   `json:"auth_models,omitempty"`
 }
 
 type PoolConfig struct {
@@ -30,6 +31,7 @@ type PoolConfig struct {
 	Description  string   `json:"description,omitempty"`
 	AuthIDs      []string `json:"auth_ids"`
 	AccountTypes []string `json:"account_types,omitempty"`
+	Models       []string `json:"models,omitempty"`
 	Enabled      bool     `json:"enabled"`
 }
 
@@ -41,7 +43,7 @@ type KeyBinding struct {
 }
 
 func NewApp() *App {
-	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}}}
+	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}}}
 }
 
 func (a *App) Shutdown() {
@@ -57,6 +59,8 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return OKEnvelope(a.registration())
 	case MethodSchedulerPick:
 		return a.pickScheduler(request)
+	case MethodResponseIntercept:
+		return a.interceptResponse(request)
 	case MethodManagementRegister:
 		return OKEnvelope(a.managementRegistration())
 	case MethodManagementHandle:
@@ -97,7 +101,7 @@ func (a *App) registration() Registration {
 				{Name: "state_file", Type: "string", Description: "JSON state file used for auth pools and API key bindings."},
 			},
 		},
-		Capabilities: Capabilities{Scheduler: true, ManagementAPI: true},
+		Capabilities: Capabilities{Scheduler: true, ResponseInterceptor: true, ManagementAPI: true},
 	}
 }
 
@@ -185,7 +189,7 @@ func (a *App) load() error {
 	raw, err := os.ReadFile(a.stateFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}}
+			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}}
 			return nil
 		}
 		return err
@@ -199,6 +203,9 @@ func (a *App) load() error {
 	}
 	if state.KeyBindings == nil {
 		state.KeyBindings = map[string]KeyBinding{}
+	}
+	if state.AuthModels == nil {
+		state.AuthModels = map[string][]string{}
 	}
 	a.state = state
 	return nil

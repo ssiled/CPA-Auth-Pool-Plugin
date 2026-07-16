@@ -16,8 +16,8 @@ func TestPluginRegistrationUsesConfiguredPluginID(t *testing.T) {
 	if registration.Metadata.Version != Version {
 		t.Fatalf("registration version = %q, want %q", registration.Metadata.Version, Version)
 	}
-	if !registration.Capabilities.Scheduler || !registration.Capabilities.ManagementAPI {
-		t.Fatalf("registration capabilities = %+v, want scheduler and management_api", registration.Capabilities)
+	if !registration.Capabilities.Scheduler || !registration.Capabilities.ResponseInterceptor || !registration.Capabilities.ManagementAPI {
+		t.Fatalf("registration capabilities = %+v, want scheduler, response_interceptor and management_api", registration.Capabilities)
 	}
 }
 
@@ -44,6 +44,22 @@ func decodeSchedulerResponse(t *testing.T, raw []byte) SchedulerPickResponse {
 		t.Fatalf("envelope error: %+v", env.Error)
 	}
 	var resp SchedulerPickResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	return resp
+}
+
+func decodeInterceptResponse(t *testing.T, raw []byte) ResponseInterceptResponse {
+	t.Helper()
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("envelope error: %+v", env.Error)
+	}
+	var resp ResponseInterceptResponse
 	if err := json.Unmarshal(env.Result, &resp); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
@@ -162,5 +178,38 @@ func TestSchedulerDoesNotFallbackWhenPoolDisabled(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "" {
 		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	}
+}
+
+func TestModelsEndpointFiltersToBoundPoolModels(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-models"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-a"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-a"}}
+
+	body := []byte(`{"object":"list","data":[{"id":"gpt-a","object":"model"},{"id":"gpt-b","object":"model"}]}`)
+	req, _ := json.Marshal(ResponseInterceptRequest{
+		Path:           "/v1/models",
+		StatusCode:     200,
+		RequestHeaders: map[string][]string{"Authorization": {"Bearer " + apiKey}},
+		Body:           body,
+	})
+	raw, err := app.HandleMethod(MethodResponseIntercept, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeInterceptResponse(t, raw)
+	if len(resp.Body) == 0 {
+		t.Fatalf("response body is empty, want filtered model list")
+	}
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 1 || payload.Data[0]["id"] != "gpt-a" {
+		t.Fatalf("filtered payload = %s, want only gpt-a", resp.Body)
 	}
 }

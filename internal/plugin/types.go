@@ -11,11 +11,12 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.9"
+	Version       = "0.1.10"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
 	MethodSchedulerPick      = "scheduler.pick"
+	MethodResponseIntercept  = "response.intercept_after"
 	MethodManagementRegister = "management.register"
 	MethodManagementHandle   = "management.handle"
 )
@@ -57,8 +58,9 @@ type ConfigField struct {
 }
 
 type Capabilities struct {
-	Scheduler     bool `json:"scheduler,omitempty"`
-	ManagementAPI bool `json:"management_api"`
+	Scheduler           bool `json:"scheduler,omitempty"`
+	ResponseInterceptor bool `json:"response_interceptor,omitempty"`
+	ManagementAPI       bool `json:"management_api"`
 }
 
 type SchedulerPickRequest struct {
@@ -85,6 +87,27 @@ type SchedulerAuthCandidate struct {
 type SchedulerPickResponse struct {
 	AuthID  string `json:"AuthID,omitempty"`
 	Handled bool   `json:"Handled"`
+}
+
+type ResponseInterceptRequest struct {
+	Method          string         `json:"Method,omitempty"`
+	Path            string         `json:"Path,omitempty"`
+	RequestPath     string         `json:"RequestPath,omitempty"`
+	RequestedModel  string         `json:"RequestedModel,omitempty"`
+	Stream          bool           `json:"Stream,omitempty"`
+	RequestHeaders  http.Header    `json:"RequestHeaders,omitempty"`
+	ResponseHeaders http.Header    `json:"ResponseHeaders,omitempty"`
+	OriginalRequest []byte         `json:"OriginalRequest,omitempty"`
+	RequestBody     []byte         `json:"RequestBody,omitempty"`
+	Body            []byte         `json:"Body,omitempty"`
+	StatusCode      int            `json:"StatusCode,omitempty"`
+	Metadata        map[string]any `json:"Metadata,omitempty"`
+}
+
+type ResponseInterceptResponse struct {
+	Headers      http.Header `json:"Headers,omitempty"`
+	Body         []byte      `json:"Body,omitempty"`
+	ClearHeaders []string    `json:"ClearHeaders,omitempty"`
 }
 
 type ManagementRegistrationRequest struct {

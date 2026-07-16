@@ -13,6 +13,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		{Method: http.MethodGet, Path: base + "/pools", Description: "List auth pools."},
 		{Method: http.MethodPost, Path: base + "/pools", Description: "Create or update an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/pools", Description: "Delete an auth pool."},
+		{Method: http.MethodPost, Path: base + "/auth-models", Description: "Sync per-auth model catalogs used to filter /v1/models."},
 		{Method: http.MethodGet, Path: base + "/bindings", Description: "List API key to pool bindings."},
 		{Method: http.MethodPost, Path: base + "/bindings", Description: "Bind an API key hash to an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/bindings", Description: "Remove an API key binding."},
@@ -35,6 +36,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.upsertPool(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/pools":
 		return OKEnvelope(a.deletePool(idFromRequest(req)))
+	case req.Method == http.MethodPost && path == base+"/auth-models":
+		return OKEnvelope(a.syncAuthModels(req.Body))
 	case req.Method == http.MethodGet && path == base+"/bindings":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"bindings": a.snapshot().Bindings}))
 	case req.Method == http.MethodPost && path == base+"/bindings":
@@ -47,8 +50,9 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 }
 
 type statusSnapshot struct {
-	Pools    []PoolConfig `json:"pools"`
-	Bindings []KeyBinding `json:"bindings"`
+	Pools      []PoolConfig        `json:"pools"`
+	Bindings   []KeyBinding        `json:"bindings"`
+	AuthModels map[string][]string `json:"auth_models,omitempty"`
 }
 
 func (a *App) snapshot() statusSnapshot {
@@ -58,7 +62,11 @@ func (a *App) snapshot() statusSnapshot {
 	for _, binding := range a.state.KeyBindings {
 		bindings = append(bindings, binding)
 	}
-	return statusSnapshot{Pools: append([]PoolConfig(nil), a.state.Pools...), Bindings: bindings}
+	authModels := make(map[string][]string, len(a.state.AuthModels))
+	for authID, models := range a.state.AuthModels {
+		authModels[authID] = append([]string(nil), models...)
+	}
+	return statusSnapshot{Pools: append([]PoolConfig(nil), a.state.Pools...), Bindings: bindings, AuthModels: authModels}
 }
 
 func (a *App) upsertPool(body []byte) ManagementResponse {
@@ -70,14 +78,21 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	pool.Name = strings.TrimSpace(pool.Name)
 	pool.AuthIDs = cleanStringList(pool.AuthIDs)
 	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
+	pool.Models = cleanModelList(pool.Models)
 	if pool.ID == "" || pool.Name == "" {
 		return jsonError(http.StatusBadRequest, "invalid_pool", "id and name are required")
 	}
 	pool.Enabled = true
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(body, &raw)
+	_, modelsProvided := raw["models"]
 	a.mu.Lock()
 	found := false
 	for i := range a.state.Pools {
 		if a.state.Pools[i].ID == pool.ID {
+			if !modelsProvided {
+				pool.Models = append([]string(nil), a.state.Pools[i].Models...)
+			}
 			a.state.Pools[i] = pool
 			found = true
 			break
@@ -116,6 +131,43 @@ func (a *App) deletePool(id string) ManagementResponse {
 		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
 	}
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true, "id": id})
+}
+
+type authModelsPayload struct {
+	AuthModels map[string][]string `json:"auth_models"`
+}
+
+func (a *App) syncAuthModels(body []byte) ManagementResponse {
+	var payload authModelsPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	next := make(map[string][]string, len(payload.AuthModels))
+	for authID, models := range payload.AuthModels {
+		authID = strings.TrimSpace(authID)
+		if authID == "" {
+			continue
+		}
+		next[authID] = cleanModelList(models)
+	}
+	a.mu.Lock()
+	a.state.AuthModels = next
+	for i := range a.state.Pools {
+		a.state.Pools[i].Models = cleanModelList(poolModelListFromAuthModels(a.state.Pools[i].AuthIDs, next))
+	}
+	a.mu.Unlock()
+	if err := a.save(); err != nil {
+		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"synced": true, "auth_count": len(next)})
+}
+
+func poolModelListFromAuthModels(authIDs []string, authModels map[string][]string) []string {
+	models := []string{}
+	for _, authID := range authIDs {
+		models = append(models, authModels[strings.TrimSpace(authID)]...)
+	}
+	return models
 }
 
 func (a *App) upsertBinding(body []byte) ManagementResponse {
