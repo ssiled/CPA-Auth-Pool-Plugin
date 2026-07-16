@@ -96,7 +96,7 @@ func (a *App) registration() Registration {
 			Name:             PluginName,
 			Version:          Version,
 			Author:           "CPA-Helper-s",
-			GitHubRepository: "https://github.com/ssiled/-CPA-Auth-Pool-Plugin",
+			GitHubRepository: "https://github.com/ssiled/CPA-Auth-Pool-Plugin",
 			ConfigFields: []ConfigField{
 				{Name: "state_file", Type: "string", Description: "JSON state file used for auth pools and API key bindings."},
 			},
@@ -118,12 +118,18 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	a.mu.RLock()
 	binding, ok := a.state.KeyBindings[apiKeyHash]
 	pool, poolOK := a.poolLocked(binding.PoolID)
+	allowedModels := a.poolModelsLocked(pool)
 	a.mu.RUnlock()
 	if !ok {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
 	if !poolOK || !pool.Enabled {
 		return OKEnvelope(SchedulerPickResponse{Handled: true})
+	}
+	if requestedModel := strings.TrimSpace(req.Model); requestedModel != "" {
+		if _, ok := allowedModels[requestedModel]; !ok {
+			return OKEnvelope(SchedulerPickResponse{Handled: true})
+		}
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
 	for _, id := range pool.AuthIDs {

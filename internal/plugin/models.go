@@ -38,11 +38,6 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 		}
 		return OKEnvelope(ResponseInterceptResponse{Headers: jsonHeaders(), Body: filtered})
 	}
-	if len(allowedModels) == 0 {
-		// No model catalog has been synced for this pool yet. Keep the upstream
-		// response unchanged rather than accidentally hiding every model.
-		return OKEnvelope(ResponseInterceptResponse{})
-	}
 	filtered, changed := filterModelsResponse(req.Body, allowedModels)
 	if !changed {
 		return OKEnvelope(ResponseInterceptResponse{})

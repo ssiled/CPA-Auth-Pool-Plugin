@@ -138,6 +138,29 @@ func TestSchedulerDoesNotFallbackWhenPoolEmpty(t *testing.T) {
 	}
 }
 
+func TestSchedulerBlocksModelsOutsideBoundPool(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-forbidden-model"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-a"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-a"}}
+
+	req := SchedulerPickRequest{
+		Model:      "gpt-b",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Priority: 100}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "" {
+		t.Fatalf("response = %+v, want forbidden model blocked", resp)
+	}
+}
+
 func TestSchedulerDoesNotFallbackWhenPoolMissing(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-missing-pool"
@@ -211,5 +234,35 @@ func TestModelsEndpointFiltersToBoundPoolModels(t *testing.T) {
 	}
 	if len(payload.Data) != 1 || payload.Data[0]["id"] != "gpt-a" {
 		t.Fatalf("filtered payload = %s, want only gpt-a", resp.Body)
+	}
+}
+
+func TestModelsEndpointFailsClosedWhenPoolHasNoModels(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-empty-models"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-empty", Name: "Pool Empty", Enabled: true, AuthIDs: []string{"auth-a"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-empty"}}
+
+	body := []byte(`{"object":"list","data":[{"id":"gpt-a","object":"model"},{"id":"gpt-b","object":"model"}]}`)
+	req, _ := json.Marshal(ResponseInterceptRequest{
+		Path:           "/v1/models",
+		StatusCode:     200,
+		RequestHeaders: map[string][]string{"Authorization": {"Bearer " + apiKey}},
+		Body:           body,
+	})
+	raw, err := app.HandleMethod(MethodResponseIntercept, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeInterceptResponse(t, raw)
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data) != 0 {
+		t.Fatalf("filtered payload = %s, want no available models", resp.Body)
 	}
 }
