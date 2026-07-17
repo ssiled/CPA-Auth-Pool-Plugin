@@ -62,10 +62,28 @@ func (a *App) reserveConcurrencySlot(candidate SchedulerAuthCandidate, tier stri
 		return
 	}
 	a.mu.Lock()
-	if a.codexConcurrencyLimitLocked(tier) <= 0 {
-		a.mu.Unlock()
-		return
+	a.reserveConcurrencySlotLocked(candidate, tier, now)
+	a.mu.Unlock()
+}
+
+func (a *App) reserveConcurrencySlotIfAvailable(candidate SchedulerAuthCandidate, tier string, now time.Time) bool {
+	tier = normalizeConcurrencyTier(tier)
+	if tier == "" {
+		return true
 	}
+	a.mu.Lock()
+	limit := a.codexConcurrencyLimitLocked(tier)
+	counts := a.codexConcurrencyCountsLocked(now)
+	if limit > 0 && counts[tier] >= limit {
+		a.mu.Unlock()
+		return false
+	}
+	a.reserveConcurrencySlotLocked(candidate, tier, now)
+	a.mu.Unlock()
+	return true
+}
+
+func (a *App) reserveConcurrencySlotLocked(candidate SchedulerAuthCandidate, tier string, now time.Time) {
 	if a.state.ConcurrencySlots == nil {
 		a.state.ConcurrencySlots = map[string]ConcurrencySlot{}
 	}
@@ -78,7 +96,6 @@ func (a *App) reserveConcurrencySlot(candidate SchedulerAuthCandidate, tier stri
 	slot.Count++
 	slot.ExpiresAt = now.Add(defaultConcurrencySlotTTL)
 	a.state.ConcurrencySlots[candidate.ID] = slot
-	a.mu.Unlock()
 }
 
 func (a *App) codexConcurrencyLimitLocked(tier string) int {
@@ -146,7 +163,7 @@ func candidateCodexConcurrencyTier(candidate SchedulerAuthCandidate) (string, bo
 
 func isCodexTier(value string) bool {
 	switch normalizeConcurrencyTier(value) {
-	case "free", "plus", "team", "pro", "enterprise", "business", "edu", "supported":
+	case "free", "plus", "team", "pro", "enterprise", "business", "edu":
 		return true
 	default:
 		return false

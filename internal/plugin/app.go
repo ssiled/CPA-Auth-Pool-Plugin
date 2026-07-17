@@ -137,7 +137,6 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	binding, ok := a.state.KeyBindings[apiKeyHash]
 	pool, poolOK := a.poolLocked(binding.PoolID)
 	allowedModels := a.poolModelsLocked(pool)
-	concurrencyCounts := a.codexConcurrencyCountsLocked(now)
 	a.mu.RUnlock()
 	if !ok {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
@@ -165,14 +164,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	candidateTiers := map[string]string{}
 	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
-		if tier, blocked := a.candidateConcurrencyBlocked(candidate, concurrencyCounts); blocked {
-			_ = tier
-			return false
-		}
 		if tier, isCodex := candidateCodexConcurrencyTier(candidate); isCodex {
 			normalizedTier := normalizeConcurrencyTier(tier)
 			candidateTiers[candidate.ID] = normalizedTier
-			concurrencyCounts[normalizedTier]++
 		}
 		return true
 	}
@@ -203,11 +197,15 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		return matched[i].Priority > matched[j].Priority
 	})
-	selected := matched[0]
-	if tier := candidateTiers[selected.ID]; tier != "" {
-		a.reserveConcurrencySlot(selected, tier, now)
+	for _, selected := range matched {
+		if tier := candidateTiers[selected.ID]; tier != "" {
+			if !a.reserveConcurrencySlotIfAvailable(selected, tier, now) {
+				continue
+			}
+		}
+		return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 	}
-	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
+	return OKEnvelope(SchedulerPickResponse{Handled: true})
 }
 
 func candidateAccountTypes(candidate SchedulerAuthCandidate) []string {
