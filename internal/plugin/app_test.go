@@ -301,6 +301,32 @@ func TestSchedulerEnforcesCodexTierConcurrencyLimit(t *testing.T) {
 		t.Fatalf("after release response = %+v, want codex-plus-a.json", resp)
 	}
 }
+func TestSchedulerReservesConcurrencyAfterPrioritySelection(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-priority-concurrency"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 1, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AccountTypes: []string{"plus"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus-low.json", Provider: "codex", Priority: 1, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-plus-high.json", Provider: "codex", Priority: 100, Attributes: map[string]string{"plan_type": "plus"}},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-high.json" {
+		t.Fatalf("response = %+v, want high priority auth", resp)
+	}
+}
+
 func TestSchedulerMatchesGeminiAndGrokAccountTypes(t *testing.T) {
 	tests := []struct {
 		name       string
