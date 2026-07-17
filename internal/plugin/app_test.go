@@ -379,6 +379,71 @@ func TestSchedulerEnforcesPerAccountCodexTierConcurrencyLimit(t *testing.T) {
 		t.Fatalf("after release response = %+v, want codex-plus-a.json", resp)
 	}
 }
+
+func TestSchedulerUsesPoolTierForExplicitAuthWithoutCandidateTier(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-test"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 1, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AuthIDs: []string{"codex-plus-a.json", "codex-plus-b.json"}, AccountTypes: []string{"plus"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus-a.json", Provider: "codex", Priority: 100},
+			{ID: "codex-plus-b.json", Provider: "codex", Priority: 90},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-a.json" {
+		t.Fatalf("first response = %+v, want codex-plus-a.json", resp)
+	}
+
+	raw, err = app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-b.json" {
+		t.Fatalf("second response = %+v, want codex-plus-b.json", resp)
+	}
+}
+
+func TestSchedulerReturnsBusyWhenExplicitPoolTierCandidateIsFull(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-test"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 1, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AuthIDs: []string{"codex-plus-a.json"}, AccountTypes: []string{"plus"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+
+	req := SchedulerPickRequest{
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "codex-plus-a.json", Provider: "codex", Priority: 100}},
+	}
+	rawReq, _ := json.Marshal(req)
+	if raw, err := app.HandleMethod(MethodSchedulerPick, rawReq); err != nil {
+		t.Fatal(err)
+	} else if resp := decodeSchedulerResponse(t, raw); !resp.Handled || resp.AuthID != "codex-plus-a.json" {
+		t.Fatalf("first response = %+v, want codex-plus-a.json", resp)
+	}
+
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_busy" || pluginErr.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("second error = %+v, want auth_pool_busy 429", pluginErr)
+	}
+}
+
 func TestSchedulerReservesConcurrencyAfterPrioritySelection(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-priority-concurrency"

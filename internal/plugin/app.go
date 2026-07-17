@@ -165,16 +165,19 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	candidateTiers := map[string]string{}
+	fallbackTier := poolFallbackConcurrencyTier(pool)
 	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
 		if tier, isCodex := candidateCodexConcurrencyTier(candidate); isCodex {
 			normalizedTier := normalizeConcurrencyTier(tier)
 			candidateTiers[candidate.ID] = normalizedTier
+		} else if fallbackTier != "" {
+			candidateTiers[candidate.ID] = fallbackTier
 		}
 		return true
 	}
 	for _, candidate := range req.Candidates {
 		if _, ok := allowed[candidate.ID]; ok {
-			if candidateConflictsWithPool(candidate, pool) {
+			if explicitCandidateConflictsWithPool(candidate, pool) {
 				continue
 			}
 			if !reserveCandidate(candidate) {
@@ -225,7 +228,15 @@ func schedulerBlocked(code, message string, status int) ([]byte, error) {
 	return ErrorEnvelope(code, "cpa-auth-pool: "+message, status), nil
 }
 
+func explicitCandidateConflictsWithPool(candidate SchedulerAuthCandidate, pool PoolConfig) bool {
+	return candidateConflictsWithPoolMode(candidate, pool, true)
+}
+
 func candidateConflictsWithPool(candidate SchedulerAuthCandidate, pool PoolConfig) bool {
+	return candidateConflictsWithPoolMode(candidate, pool, false)
+}
+
+func candidateConflictsWithPoolMode(candidate SchedulerAuthCandidate, pool PoolConfig, allowUnknownTier bool) bool {
 	poolTiers := poolStrictCodexTiers(pool)
 	if len(poolTiers) == 0 {
 		return false
@@ -235,7 +246,7 @@ func candidateConflictsWithPool(candidate SchedulerAuthCandidate, pool PoolConfi
 		candidateTiers = candidateInferredCodexTiers(candidate)
 	}
 	if len(candidateTiers) == 0 {
-		return true
+		return !allowUnknownTier
 	}
 	for tier := range candidateTiers {
 		if _, ok := poolTiers[tier]; ok {
@@ -253,6 +264,17 @@ func poolStrictCodexTiers(pool PoolConfig) map[string]struct{} {
 		}
 	}
 	return tiers
+}
+
+func poolFallbackConcurrencyTier(pool PoolConfig) string {
+	tiers := poolStrictCodexTiers(pool)
+	if len(tiers) != 1 {
+		return ""
+	}
+	for tier := range tiers {
+		return tier
+	}
+	return ""
 }
 
 func candidateDeclaredCodexTiers(candidate SchedulerAuthCandidate) map[string]struct{} {
