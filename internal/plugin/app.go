@@ -125,7 +125,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	apiKey := extractAPIKey(req.Options.Headers)
 	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
 	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
-		return OKEnvelope(SchedulerPickResponse{Handled: false})
+		return schedulerBlocked("untrusted_proxy_key", "helper API key hash header requires a trusted CPA proxy key", http.StatusForbidden)
 	}
 	if apiKeyHash == "" && apiKey != "" {
 		apiKeyHash = hashAPIKey(apiKey)
@@ -142,11 +142,11 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
 	if !poolOK || !pool.Enabled {
-		return OKEnvelope(SchedulerPickResponse{Handled: true})
+		return schedulerBlocked("auth_pool_unavailable", "bound auth pool is unavailable", http.StatusServiceUnavailable)
 	}
 	if requestedModel := strings.TrimSpace(req.Model); requestedModel != "" {
 		if _, ok := allowedModels[normalizeModelID(requestedModel)]; !ok {
-			return OKEnvelope(SchedulerPickResponse{Handled: true})
+			return schedulerBlocked("model_not_allowed", "requested model is outside the bound auth pool", http.StatusForbidden)
 		}
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
@@ -157,8 +157,8 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	allowedTypes := make(map[string]struct{}, len(pool.AccountTypes))
 	for _, accountType := range pool.AccountTypes {
-		if accountType = normalizeAccountType(accountType); accountType != "" {
-			allowedTypes[accountType] = struct{}{}
+		for _, normalized := range poolAccountTypeMatches(accountType) {
+			allowedTypes[normalized] = struct{}{}
 		}
 	}
 	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
@@ -172,10 +172,16 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	for _, candidate := range req.Candidates {
 		if _, ok := allowed[candidate.ID]; ok {
+			if candidateConflictsWithPool(candidate, pool) {
+				continue
+			}
 			if !reserveCandidate(candidate) {
 				continue
 			}
 			matched = append(matched, candidate)
+			continue
+		}
+		if candidateConflictsWithPool(candidate, pool) {
 			continue
 		}
 		for _, candidateType := range candidateAccountTypes(candidate) {
@@ -189,7 +195,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 	}
 	if len(matched) == 0 {
-		return OKEnvelope(SchedulerPickResponse{Handled: true})
+		return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no eligible auth candidates", http.StatusServiceUnavailable)
 	}
 	sort.Slice(matched, func(i, j int) bool {
 		if matched[i].Priority == matched[j].Priority {
@@ -205,7 +211,120 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 	}
-	return OKEnvelope(SchedulerPickResponse{Handled: true})
+	return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no available auth candidates", http.StatusServiceUnavailable)
+}
+
+func schedulerBlocked(code, message string, status int) ([]byte, error) {
+	return ErrorEnvelope(code, "cpa-auth-pool: "+message, status), nil
+}
+
+func candidateConflictsWithPool(candidate SchedulerAuthCandidate, pool PoolConfig) bool {
+	poolTiers := poolStrictCodexTiers(pool)
+	if len(poolTiers) == 0 {
+		return false
+	}
+	candidateTiers := candidateDeclaredCodexTiers(candidate)
+	if len(candidateTiers) == 0 {
+		candidateTiers = candidateInferredCodexTiers(candidate)
+	}
+	if len(candidateTiers) == 0 {
+		return true
+	}
+	for tier := range candidateTiers {
+		if _, ok := poolTiers[tier]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+func poolStrictCodexTiers(pool PoolConfig) map[string]struct{} {
+	tiers := map[string]struct{}{}
+	for _, accountType := range pool.AccountTypes {
+		for _, tier := range strictCodexTiersFromValue(accountType) {
+			tiers[tier] = struct{}{}
+		}
+	}
+	return tiers
+}
+
+func candidateDeclaredCodexTiers(candidate SchedulerAuthCandidate) map[string]struct{} {
+	tiers := map[string]struct{}{}
+	for _, key := range []string{"account_type", "accountType", "plan_type", "tier", "chatgpt_plan_type", "chatgptPlanType", "planType", "type", "kind"} {
+		if candidate.Attributes != nil {
+			for _, tier := range strictCodexTiersFromValue(candidate.Attributes[key]) {
+				tiers[tier] = struct{}{}
+			}
+		}
+		if candidate.Metadata != nil {
+			if text, ok := candidate.Metadata[key].(string); ok {
+				for _, tier := range strictCodexTiersFromValue(text) {
+					tiers[tier] = struct{}{}
+				}
+			}
+		}
+	}
+	return tiers
+}
+
+func candidateInferredCodexTiers(candidate SchedulerAuthCandidate) map[string]struct{} {
+	tiers := map[string]struct{}{}
+	for _, value := range []string{candidate.Provider, candidate.ID} {
+		for _, tier := range strictCodexTiersFromValue(value) {
+			tiers[tier] = struct{}{}
+		}
+	}
+	return tiers
+}
+
+func poolAccountTypeMatches(value string) []string {
+	seen := map[string]struct{}{}
+	matches := []string{}
+	add := func(candidate string) {
+		candidate = normalizeAccountType(candidate)
+		if candidate == "" {
+			return
+		}
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		matches = append(matches, candidate)
+	}
+	add(value)
+	for _, tier := range strictCodexTiersFromValue(value) {
+		add(tier)
+	}
+	return matches
+}
+
+func strictCodexTiersFromValue(value string) []string {
+	seen := map[string]struct{}{}
+	tiers := []string{}
+	add := func(candidate string) {
+		if tier := normalizeStrictCodexTier(candidate); tier != "" {
+			if _, ok := seen[tier]; ok {
+				return
+			}
+			seen[tier] = struct{}{}
+			tiers = append(tiers, tier)
+		}
+	}
+	normalized := normalizeAccountType(value)
+	add(normalized)
+	for _, part := range strings.FieldsFunc(normalized, func(r rune) bool { return r == '_' }) {
+		add(part)
+	}
+	return tiers
+}
+
+func normalizeStrictCodexTier(value string) string {
+	switch normalizeConcurrencyTier(value) {
+	case "free", "plus", "team", "pro", "enterprise", "business", "edu", "education", "student", "k12":
+		return normalizeConcurrencyTier(value)
+	default:
+		return ""
+	}
 }
 
 func candidateAccountTypes(candidate SchedulerAuthCandidate) []string {

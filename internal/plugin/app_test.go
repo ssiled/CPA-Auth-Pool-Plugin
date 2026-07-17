@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"net/http"
 	"path/filepath"
 	"testing"
 )
@@ -48,6 +49,18 @@ func decodeSchedulerResponse(t *testing.T, raw []byte) SchedulerPickResponse {
 		t.Fatalf("decode result: %v", err)
 	}
 	return resp
+}
+
+func decodeEnvelopeError(t *testing.T, raw []byte) *EnvelopeError {
+	t.Helper()
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %+v, want plugin error", env)
+	}
+	return env.Error
 }
 
 func decodeInterceptResponse(t *testing.T, raw []byte) ResponseInterceptResponse {
@@ -174,9 +187,9 @@ func TestSchedulerDoesNotTreatOpenAICompatibleAsCodexPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("response = %+v, want fail-closed empty AuthID", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 }
 
@@ -223,9 +236,9 @@ func TestSchedulerIgnoresHelperAPIKeyHashWithoutTrustedProxyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if resp.Handled {
-		t.Fatalf("response = %+v, want unhandled untrusted helper hash", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "untrusted_proxy_key" || pluginErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("error = %+v, want untrusted_proxy_key 403", pluginErr)
 	}
 }
 
@@ -251,6 +264,30 @@ func TestSchedulerMatchesDynamicAccountType(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "codex-plus-new.json" {
 		t.Fatalf("response = %+v, want dynamically matched plus account", resp)
+	}
+}
+
+func TestSchedulerRejectsExplicitFreeAuthInPlusPool(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-plus-strict"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AuthIDs: []string{"codex-free.json"}, AccountTypes: []string{"plus/team"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-free.json", Provider: "codex", Priority: 100, Attributes: map[string]string{"plan_type": "free"}},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 }
 
@@ -283,9 +320,9 @@ func TestSchedulerEnforcesCodexTierConcurrencyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp = decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("second response = %+v, want no auth while plus limit is full", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("second error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 
 	usageRaw, _ := json.Marshal(UsageRecord{AuthID: "codex-plus-a.json"})
@@ -380,9 +417,9 @@ func TestSchedulerDoesNotFallbackWhenPoolEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 }
 
@@ -403,9 +440,9 @@ func TestSchedulerBlocksModelsOutsideBoundPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("response = %+v, want forbidden model blocked", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "model_not_allowed" || pluginErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("error = %+v, want model_not_allowed 403", pluginErr)
 	}
 }
 
@@ -424,9 +461,9 @@ func TestSchedulerDoesNotFallbackWhenPoolMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 }
 
@@ -446,9 +483,9 @@ func TestSchedulerDoesNotFallbackWhenPoolDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := decodeSchedulerResponse(t, raw)
-	if !resp.Handled || resp.AuthID != "" {
-		t.Fatalf("response = %+v, want handled empty AuthID", resp)
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("error = %+v, want auth_pool_unavailable 503", pluginErr)
 	}
 }
 
