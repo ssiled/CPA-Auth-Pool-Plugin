@@ -205,13 +205,18 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		return matched[i].Priority > matched[j].Priority
 	})
+	blockedByConcurrency := false
 	for _, selected := range matched {
 		if tier := candidateTiers[selected.ID]; tier != "" {
 			if !a.reserveConcurrencySlotIfAvailable(selected, tier, now) {
+				blockedByConcurrency = true
 				continue
 			}
 		}
 		return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
+	}
+	if blockedByConcurrency {
+		return schedulerBlocked("auth_pool_busy", "bound auth pool accounts are at concurrency limit", http.StatusTooManyRequests)
 	}
 	return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no available auth candidates", http.StatusServiceUnavailable)
 }

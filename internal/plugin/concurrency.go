@@ -73,10 +73,19 @@ func (a *App) reserveConcurrencySlotIfAvailable(candidate SchedulerAuthCandidate
 	}
 	a.mu.Lock()
 	limit := a.codexConcurrencyLimitLocked(tier)
-	counts := a.codexConcurrencyCountsLocked(now)
-	if limit > 0 && counts[tier] >= limit {
-		a.mu.Unlock()
-		return false
+	if limit > 0 {
+		slot := a.state.ConcurrencySlots[candidate.ID]
+		if slot.ExpiresAt.IsZero() || !now.Before(slot.ExpiresAt) {
+			slot = ConcurrencySlot{}
+		}
+		count := slot.Count
+		if count <= 0 && !slot.ExpiresAt.IsZero() {
+			count = 1
+		}
+		if count >= limit {
+			a.mu.Unlock()
+			return false
+		}
 	}
 	a.reserveConcurrencySlotLocked(candidate, tier, now)
 	a.mu.Unlock()

@@ -323,7 +323,7 @@ func TestSchedulerRejectsExplicitFreeAuthInPlusPool(t *testing.T) {
 	}
 }
 
-func TestSchedulerEnforcesCodexTierConcurrencyLimit(t *testing.T) {
+func TestSchedulerEnforcesPerAccountCodexTierConcurrencyLimit(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-concurrency"
 	apiKeyHash := hashAPIKey(apiKey)
@@ -352,9 +352,18 @@ func TestSchedulerEnforcesCodexTierConcurrencyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	resp = decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-b.json" {
+		t.Fatalf("second response = %+v, want next account codex-plus-b.json", resp)
+	}
+
+	raw, err = app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pluginErr := decodeEnvelopeError(t, raw)
-	if pluginErr.Code != "auth_pool_unavailable" || pluginErr.HTTPStatus != http.StatusServiceUnavailable {
-		t.Fatalf("second error = %+v, want auth_pool_unavailable 503", pluginErr)
+	if pluginErr.Code != "auth_pool_busy" || pluginErr.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("third error = %+v, want auth_pool_busy 429", pluginErr)
 	}
 
 	usageRaw, _ := json.Marshal(UsageRecord{AuthID: "codex-plus-a.json"})
