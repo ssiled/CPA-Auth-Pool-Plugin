@@ -16,8 +16,8 @@ func TestPluginRegistrationUsesConfiguredPluginID(t *testing.T) {
 	if registration.Metadata.Version != Version {
 		t.Fatalf("registration version = %q, want %q", registration.Metadata.Version, Version)
 	}
-	if !registration.Capabilities.Scheduler || !registration.Capabilities.ResponseInterceptor || !registration.Capabilities.ManagementAPI {
-		t.Fatalf("registration capabilities = %+v, want scheduler, response_interceptor and management_api", registration.Capabilities)
+	if !registration.Capabilities.ModelRouter || !registration.Capabilities.Scheduler || !registration.Capabilities.ResponseInterceptor || !registration.Capabilities.ManagementAPI {
+		t.Fatalf("registration capabilities = %+v, want model_router, scheduler, response_interceptor and management_api", registration.Capabilities)
 	}
 }
 
@@ -66,6 +66,22 @@ func decodeInterceptResponse(t *testing.T, raw []byte) ResponseInterceptResponse
 	return resp
 }
 
+func decodeRouteResponse(t *testing.T, raw []byte) ModelRouteResponse {
+	t.Helper()
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("envelope error: %+v", env.Error)
+	}
+	var resp ModelRouteResponse
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	return resp
+}
+
 func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-test"
@@ -88,6 +104,55 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "auth-b" {
 		t.Fatalf("response = %+v, want auth-b", resp)
+	}
+}
+
+func TestModelRouteLocksCodexPoolToCodexProvider(t *testing.T) {
+	app := NewApp()
+	headerKeyHash := hashAPIKey("sk-helper-local")
+	app.state.ProxyKeyHashes = []string{hashAPIKey("sk-cpa-upstream")}
+	app.state.Pools = []PoolConfig{{ID: "plus-team", Name: "Plus Team", Enabled: true, AccountTypes: []string{"plus", "team"}, Models: []string{"gpt-5.5 xhigh"}}}
+	app.state.KeyBindings = map[string]KeyBinding{headerKeyHash: {APIKeyHash: headerKeyHash, PoolID: "plus-team"}}
+
+	req := ModelRouteRequest{
+		RequestedModel: "gpt-5.5 xhigh",
+		Headers: map[string][]string{
+			"Authorization":        {"Bearer sk-cpa-upstream"},
+			helperAPIKeyHashHeader: {headerKeyHash},
+		},
+		AvailableProviders: []string{"codex", "openai-compatible-https://vip.j3gb.com"},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodModelRoute, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeRouteResponse(t, raw)
+	if !resp.Handled || resp.TargetKind != "provider" || resp.Target != "codex" || resp.TargetModel != "gpt-5.5 xhigh" {
+		t.Fatalf("response = %+v, want codex route", resp)
+	}
+}
+
+func TestModelRouteBlocksModelOutsideBoundPool(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-bound"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "codex", Name: "Codex", Enabled: true, AccountTypes: []string{"codex"}, Models: []string{"gpt-5.5 xhigh"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "codex"}}
+
+	req := ModelRouteRequest{
+		RequestedModel:     "gpt-5.5 high",
+		Headers:            map[string][]string{"Authorization": {"Bearer " + apiKey}},
+		AvailableProviders: []string{"codex", "openai-compatible-https://vip.j3gb.com"},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodModelRoute, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeRouteResponse(t, raw)
+	if !resp.Handled || resp.Target != "" || resp.TargetModel != "" {
+		t.Fatalf("response = %+v, want fail-closed empty route", resp)
 	}
 }
 
@@ -189,6 +254,53 @@ func TestSchedulerMatchesDynamicAccountType(t *testing.T) {
 	}
 }
 
+func TestSchedulerEnforcesCodexTierConcurrencyLimit(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-concurrency"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 1, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AccountTypes: []string{"plus"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus-a.json", Provider: "codex", Priority: 100, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-plus-b.json", Provider: "codex", Priority: 90, Attributes: map[string]string{"plan_type": "plus"}},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-a.json" {
+		t.Fatalf("first response = %+v, want codex-plus-a.json", resp)
+	}
+
+	raw, err = app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "" {
+		t.Fatalf("second response = %+v, want no auth while plus limit is full", resp)
+	}
+
+	usageRaw, _ := json.Marshal(UsageRecord{AuthID: "codex-plus-a.json"})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageRaw); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "codex-plus-a.json" {
+		t.Fatalf("after release response = %+v, want codex-plus-a.json", resp)
+	}
+}
 func TestSchedulerMatchesGeminiAndGrokAccountTypes(t *testing.T) {
 	tests := []struct {
 		name       string

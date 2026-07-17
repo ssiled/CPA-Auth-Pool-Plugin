@@ -7,6 +7,7 @@
 - Manage CPA auth accounts as pools from CPA-Helper-s `Auth Pools`.
 - Bind an API key to a request pool when creating or editing the key.
 - At request time, the plugin hashes the incoming API key and schedules only auth candidates from the bound pool.
+- Before CPA schedules a request, the plugin routes bound Codex/Gemini/Grok/Claude/Antigravity pools to their matching provider so CPA will not fall back to unrelated providers for that key.
 - If a key is bound to a pool but that pool has no matching candidate, the plugin blocks fallback to other pools.
 - API keys without pool bindings keep CPA default scheduling behavior.
 
@@ -58,6 +59,7 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 ## Notes
 
 - Pool account IDs must match CPA scheduler candidate auth IDs. The UI currently uses account names from CPA-Helper-s account inspection.
+- Provider routing depends on pool account types. Prefer type-based pools such as `free`, `plus`, `team`, `gemini`, or `grok` when you need strict provider isolation.
 - Bound pools intentionally fail closed: empty or unavailable pools do not fall back to other pools.
 - Back up `cpa-auth-pool-state.json` because it stores pool definitions and key bindings used by CPA runtime.
 

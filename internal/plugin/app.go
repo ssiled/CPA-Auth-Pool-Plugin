@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type App struct {
@@ -22,10 +23,12 @@ type App struct {
 const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
 
 type State struct {
-	Pools          []PoolConfig          `json:"pools"`
-	KeyBindings    map[string]KeyBinding `json:"key_bindings"`
-	AuthModels     map[string][]string   `json:"auth_models,omitempty"`
-	ProxyKeyHashes []string              `json:"proxy_key_hashes,omitempty"`
+	Pools                  []PoolConfig               `json:"pools"`
+	KeyBindings            map[string]KeyBinding      `json:"key_bindings"`
+	AuthModels             map[string][]string        `json:"auth_models,omitempty"`
+	ProxyKeyHashes         []string                   `json:"proxy_key_hashes,omitempty"`
+	CodexConcurrencyLimits map[string]int             `json:"codex_concurrency_limits,omitempty"`
+	ConcurrencySlots       map[string]ConcurrencySlot `json:"concurrency_slots,omitempty"`
 }
 
 type PoolConfig struct {
@@ -46,7 +49,7 @@ type KeyBinding struct {
 }
 
 func NewApp() *App {
-	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}}}
+	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}}}
 }
 
 func (a *App) Shutdown() {
@@ -60,8 +63,12 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		return OKEnvelope(a.registration())
+	case MethodModelRoute:
+		return a.routeModel(request)
 	case MethodSchedulerPick:
 		return a.pickScheduler(request)
+	case MethodUsageHandle:
+		return a.handleUsage(request)
 	case MethodResponseIntercept:
 		return a.interceptResponse(request)
 	case MethodManagementRegister:
@@ -104,7 +111,7 @@ func (a *App) registration() Registration {
 				{Name: "state_file", Type: "string", Description: "JSON state file used for auth pools and API key bindings."},
 			},
 		},
-		Capabilities: Capabilities{Scheduler: true, ResponseInterceptor: true, ManagementAPI: true},
+		Capabilities: Capabilities{ModelRouter: true, Scheduler: true, ResponseInterceptor: true, ManagementAPI: true, UsagePlugin: true},
 	}
 }
 
@@ -113,6 +120,8 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	now := time.Now()
+	a.clearExpiredConcurrencySlots(now)
 	apiKey := extractAPIKey(req.Options.Headers)
 	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
 	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
@@ -128,6 +137,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	binding, ok := a.state.KeyBindings[apiKeyHash]
 	pool, poolOK := a.poolLocked(binding.PoolID)
 	allowedModels := a.poolModelsLocked(pool)
+	concurrencyCounts := a.codexConcurrencyCountsLocked(now)
 	a.mu.RUnlock()
 	if !ok {
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
@@ -153,13 +163,32 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 	}
 	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
+	candidateTiers := map[string]string{}
+	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
+		if tier, blocked := a.candidateConcurrencyBlocked(candidate, concurrencyCounts); blocked {
+			_ = tier
+			return false
+		}
+		if tier, isCodex := candidateCodexConcurrencyTier(candidate); isCodex {
+			normalizedTier := normalizeConcurrencyTier(tier)
+			candidateTiers[candidate.ID] = normalizedTier
+			concurrencyCounts[normalizedTier]++
+		}
+		return true
+	}
 	for _, candidate := range req.Candidates {
 		if _, ok := allowed[candidate.ID]; ok {
+			if !reserveCandidate(candidate) {
+				continue
+			}
 			matched = append(matched, candidate)
 			continue
 		}
 		for _, candidateType := range candidateAccountTypes(candidate) {
 			if _, ok := allowedTypes[candidateType]; ok {
+				if !reserveCandidate(candidate) {
+					break
+				}
 				matched = append(matched, candidate)
 				break
 			}
@@ -174,7 +203,11 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		return matched[i].Priority > matched[j].Priority
 	})
-	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: matched[0].ID})
+	selected := matched[0]
+	if tier := candidateTiers[selected.ID]; tier != "" {
+		a.reserveConcurrencySlot(selected, tier, now)
+	}
+	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 }
 
 func candidateAccountTypes(candidate SchedulerAuthCandidate) []string {
@@ -222,6 +255,8 @@ func accountTypeAliases(value string) []string {
 		aliases = append(aliases, "claude")
 	case normalized == "codex" || strings.Contains(normalized, "codex") || strings.Contains(normalized, "chatgpt"):
 		aliases = append(aliases, "codex")
+	case normalized == "free" || normalized == "plus" || normalized == "team" || normalized == "pro" || normalized == "enterprise" || normalized == "k12" || normalized == "edu" || normalized == "education" || normalized == "student":
+		aliases = append(aliases, "codex")
 	}
 	return aliases
 }
@@ -261,7 +296,7 @@ func (a *App) load() error {
 	raw, err := os.ReadFile(a.stateFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}}
+			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}}
 			return nil
 		}
 		return err
@@ -281,6 +316,12 @@ func (a *App) load() error {
 	}
 	if state.ProxyKeyHashes == nil {
 		state.ProxyKeyHashes = []string{}
+	}
+	if state.CodexConcurrencyLimits == nil {
+		state.CodexConcurrencyLimits = defaultCodexConcurrencyLimits()
+	}
+	if state.ConcurrencySlots == nil {
+		state.ConcurrencySlots = map[string]ConcurrencySlot{}
 	}
 	a.state = state
 	return nil

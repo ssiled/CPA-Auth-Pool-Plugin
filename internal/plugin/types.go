@@ -11,11 +11,13 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.14"
+	Version       = "0.1.15"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
+	MethodModelRoute         = "model.route"
 	MethodSchedulerPick      = "scheduler.pick"
+	MethodUsageHandle        = "usage.handle"
 	MethodResponseIntercept  = "response.intercept_after"
 	MethodManagementRegister = "management.register"
 	MethodManagementHandle   = "management.handle"
@@ -58,9 +60,11 @@ type ConfigField struct {
 }
 
 type Capabilities struct {
+	ModelRouter         bool `json:"model_router,omitempty"`
 	Scheduler           bool `json:"scheduler,omitempty"`
 	ResponseInterceptor bool `json:"response_interceptor,omitempty"`
 	ManagementAPI       bool `json:"management_api"`
+	UsagePlugin         bool `json:"usage_plugin,omitempty"`
 }
 
 type SchedulerPickRequest struct {
@@ -89,6 +93,25 @@ type SchedulerPickResponse struct {
 	Handled bool   `json:"Handled"`
 }
 
+type ModelRouteRequest struct {
+	SourceFormat       string         `json:"SourceFormat,omitempty"`
+	RequestedModel     string         `json:"RequestedModel"`
+	Stream             bool           `json:"Stream,omitempty"`
+	Headers            http.Header    `json:"Headers,omitempty"`
+	Query              url.Values     `json:"Query,omitempty"`
+	Body               []byte         `json:"Body,omitempty"`
+	Metadata           map[string]any `json:"Metadata,omitempty"`
+	AvailableProviders []string       `json:"AvailableProviders,omitempty"`
+}
+
+type ModelRouteResponse struct {
+	Handled     bool   `json:"Handled"`
+	TargetKind  string `json:"TargetKind,omitempty"`
+	Target      string `json:"Target,omitempty"`
+	TargetModel string `json:"TargetModel,omitempty"`
+	Reason      string `json:"Reason,omitempty"`
+}
+
 type ResponseInterceptRequest struct {
 	Method          string         `json:"Method,omitempty"`
 	Path            string         `json:"Path,omitempty"`
@@ -108,6 +131,20 @@ type ResponseInterceptResponse struct {
 	Headers      http.Header `json:"Headers,omitempty"`
 	Body         []byte      `json:"Body,omitempty"`
 	ClearHeaders []string    `json:"ClearHeaders,omitempty"`
+}
+
+type UsageRecord struct {
+	Provider        string       `json:"Provider,omitempty"`
+	AuthID          string       `json:"AuthID,omitempty"`
+	AuthType        string       `json:"AuthType,omitempty"`
+	Failed          bool         `json:"Failed,omitempty"`
+	Failure         UsageFailure `json:"Failure,omitempty"`
+	ResponseHeaders http.Header  `json:"ResponseHeaders,omitempty"`
+}
+
+type UsageFailure struct {
+	StatusCode int    `json:"StatusCode,omitempty"`
+	Body       string `json:"Body,omitempty"`
 }
 
 type ManagementRegistrationRequest struct {

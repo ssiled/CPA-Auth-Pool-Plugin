@@ -47,7 +47,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            version="0.1.14"
+            version="0.1.15"
           fi
 
           package_dir="$RUNNER_TEMP/cpa-auth-pool-package"

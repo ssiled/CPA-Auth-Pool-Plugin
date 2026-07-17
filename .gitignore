@@ -1,0 +1,7 @@
+dist/
+*.so
+*.h
+*.dll
+*.dylib
+cpa-auth-pool-state.json
+**/cpa-auth-pool-state.json

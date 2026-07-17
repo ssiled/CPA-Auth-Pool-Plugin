@@ -3,13 +3,15 @@ package plugin
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 )
 
 func (a *App) managementRegistration() ManagementRegistrationResponse {
 	base := "/v0/management/plugins/" + PluginID
 	return ManagementRegistrationResponse{Routes: []ManagementRoute{
-		{Method: http.MethodGet, Path: base + "/status", Description: "List auth pools and API key bindings."},
+		{Method: http.MethodGet, Path: base + "/status", Description: "List auth pools, API key bindings, and Codex concurrency limits."},
 		{Method: http.MethodGet, Path: base + "/pools", Description: "List auth pools."},
 		{Method: http.MethodPost, Path: base + "/pools", Description: "Create or update an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/pools", Description: "Delete an auth pool."},
@@ -18,6 +20,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		{Method: http.MethodGet, Path: base + "/bindings", Description: "List API key to pool bindings."},
 		{Method: http.MethodPost, Path: base + "/bindings", Description: "Bind an API key hash to an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/bindings", Description: "Remove an API key binding."},
+		{Method: http.MethodPost, Path: base + "/codex-concurrency-limits", Description: "Configure per-tier Codex concurrency limits."},
+		{Method: http.MethodDelete, Path: base + "/concurrency-slots", Description: "Reset one or all in-flight concurrency slots."},
 	}}
 }
 
@@ -47,19 +51,44 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.upsertBinding(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/bindings":
 		return OKEnvelope(a.deleteBinding(hashFromRequest(req)))
+	case req.Method == http.MethodPost && path == base+"/codex-concurrency-limits":
+		return OKEnvelope(a.updateCodexConcurrencyLimits(req.Body))
+	case req.Method == http.MethodDelete && path == base+"/concurrency-slots":
+		return OKEnvelope(a.deleteConcurrencySlot(req))
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "route not found"))
 	}
 }
 
 type statusSnapshot struct {
-	Pools      []PoolConfig        `json:"pools"`
-	Bindings   []KeyBinding        `json:"bindings"`
-	AuthModels map[string][]string `json:"auth_models,omitempty"`
-	ProxyKeyCount int              `json:"proxy_key_count"`
+	Pools                  []PoolConfig              `json:"pools"`
+	Bindings               []KeyBinding              `json:"bindings"`
+	AuthModels             map[string][]string       `json:"auth_models,omitempty"`
+	ProxyKeyCount          int                       `json:"proxy_key_count"`
+	CodexConcurrencyLimits map[string]int            `json:"codex_concurrency_limits"`
+	Concurrency            concurrencySnapshot       `json:"concurrency"`
+	ConcurrencySlots       []concurrencySlotSnapshot `json:"concurrency_slots,omitempty"`
+}
+
+type concurrencySnapshot struct {
+	Counts map[string]int `json:"counts"`
+	Limits map[string]int `json:"limits"`
+}
+
+type concurrencySlotSnapshot struct {
+	AuthID           string `json:"auth_id"`
+	Tier             string `json:"tier"`
+	Count            int    `json:"count"`
+	StartedAt        string `json:"started_at,omitempty"`
+	StartedAtUnix    int64  `json:"started_at_unix,omitempty"`
+	ExpiresAt        string `json:"expires_at"`
+	ExpiresAtUnix    int64  `json:"expires_at_unix"`
+	RemainingSeconds int64  `json:"remaining_seconds"`
 }
 
 func (a *App) snapshot() statusSnapshot {
+	now := time.Now()
+	a.clearExpiredConcurrencySlots(now)
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	bindings := make([]KeyBinding, 0, len(a.state.KeyBindings))
@@ -70,7 +99,141 @@ func (a *App) snapshot() statusSnapshot {
 	for authID, models := range a.state.AuthModels {
 		authModels[authID] = append([]string(nil), models...)
 	}
-	return statusSnapshot{Pools: append([]PoolConfig(nil), a.state.Pools...), Bindings: bindings, AuthModels: authModels, ProxyKeyCount: len(a.state.ProxyKeyHashes)}
+	limits := cloneConcurrencyLimits(a.state.CodexConcurrencyLimits)
+	counts := a.codexConcurrencyCountsLocked(now)
+	return statusSnapshot{
+		Pools:                  append([]PoolConfig(nil), a.state.Pools...),
+		Bindings:               bindings,
+		AuthModels:             authModels,
+		ProxyKeyCount:          len(a.state.ProxyKeyHashes),
+		CodexConcurrencyLimits: limits,
+		Concurrency:            concurrencySnapshot{Counts: counts, Limits: limits},
+		ConcurrencySlots:       concurrencySlotSnapshots(now, a.state.ConcurrencySlots),
+	}
+}
+
+func cloneConcurrencyLimits(limits map[string]int) map[string]int {
+	if len(limits) == 0 {
+		limits = defaultCodexConcurrencyLimits()
+	}
+	cloned := make(map[string]int, len(limits))
+	for tier, limit := range limits {
+		tier = normalizeConcurrencyTier(tier)
+		if tier == "" || limit < 0 {
+			continue
+		}
+		cloned[tier] = limit
+	}
+	return cloned
+}
+
+func concurrencySlotSnapshots(now time.Time, slots map[string]ConcurrencySlot) []concurrencySlotSnapshot {
+	items := make([]concurrencySlotSnapshot, 0, len(slots))
+	for authID, slot := range slots {
+		if slot.ExpiresAt.IsZero() || !now.Before(slot.ExpiresAt) {
+			continue
+		}
+		count := slot.Count
+		if count <= 0 {
+			count = 1
+		}
+		item := concurrencySlotSnapshot{
+			AuthID:           authID,
+			Tier:             normalizeConcurrencyTier(slot.Tier),
+			Count:            count,
+			ExpiresAt:        slot.ExpiresAt.Format(time.RFC3339),
+			ExpiresAtUnix:    slot.ExpiresAt.Unix(),
+			RemainingSeconds: int64(slot.ExpiresAt.Sub(now).Seconds()),
+		}
+		if !slot.StartedAt.IsZero() {
+			item.StartedAt = slot.StartedAt.Format(time.RFC3339)
+			item.StartedAtUnix = slot.StartedAt.Unix()
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Tier == items[j].Tier {
+			return items[i].AuthID < items[j].AuthID
+		}
+		return items[i].Tier < items[j].Tier
+	})
+	return items
+}
+
+func (a *App) updateCodexConcurrencyLimits(body []byte) ManagementResponse {
+	var payload struct {
+		Limits map[string]int `json:"limits"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	next := normalizeConcurrencyLimits(payload.Limits)
+	a.mu.Lock()
+	a.state.CodexConcurrencyLimits = next
+	a.mu.Unlock()
+	if err := a.save(); err != nil {
+		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"codex_concurrency_limits": next, "status": a.snapshot()})
+}
+
+func normalizeConcurrencyLimits(limits map[string]int) map[string]int {
+	defaults := defaultCodexConcurrencyLimits()
+	if limits == nil {
+		return defaults
+	}
+	next := map[string]int{}
+	for tier, limit := range limits {
+		tier = normalizeConcurrencyTier(tier)
+		if tier == "" || limit < 0 {
+			continue
+		}
+		next[tier] = limit
+	}
+	for tier, limit := range defaults {
+		if _, ok := next[tier]; !ok {
+			next[tier] = limit
+		}
+	}
+	return next
+}
+
+func (a *App) deleteConcurrencySlot(req ManagementRequest) ManagementResponse {
+	all := strings.EqualFold(req.Query.Get("all"), "true")
+	authID := strings.TrimSpace(req.Query.Get("auth_id"))
+	if len(req.Body) > 0 {
+		var body struct {
+			All    bool   `json:"all"`
+			AuthID string `json:"auth_id"`
+		}
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+		}
+		all = all || body.All
+		if strings.TrimSpace(body.AuthID) != "" {
+			authID = strings.TrimSpace(body.AuthID)
+		}
+	}
+	a.mu.Lock()
+	removed := 0
+	if all {
+		removed = len(a.state.ConcurrencySlots)
+		a.state.ConcurrencySlots = map[string]ConcurrencySlot{}
+	} else {
+		if authID == "" {
+			a.mu.Unlock()
+			return jsonError(http.StatusBadRequest, "missing_auth_id", "auth_id or all=true is required")
+		}
+		if _, ok := a.state.ConcurrencySlots[authID]; ok {
+			delete(a.state.ConcurrencySlots, authID)
+			removed = 1
+		}
+	}
+	a.mu.Unlock()
+	if err := a.save(); err != nil {
+		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"removed": removed, "auth_id": authID, "status": a.snapshot()})
 }
 
 func (a *App) upsertPool(body []byte) ManagementResponse {
