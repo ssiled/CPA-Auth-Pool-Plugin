@@ -332,6 +332,32 @@ func TestSchedulerUsesHelperAPIKeyHashHeader(t *testing.T) {
 	}
 }
 
+func TestSchedulerBlocksTrustedProxyHashWithoutBinding(t *testing.T) {
+	app := NewApp()
+	app.state.ProxyKeyHashes = []string{hashAPIKey("sk-cpa-upstream")}
+	headerKeyHash := hashAPIKey("sk-helper-local")
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{
+			"Authorization":        {"Bearer sk-cpa-upstream"},
+			helperAPIKeyHashHeader: {headerKeyHash},
+		}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Provider: "codex"}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_required" || pluginErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("error = %+v, want auth_pool_required 403", pluginErr)
+	}
+	event := app.pluginEventSnapshot(1).Items[0]
+	if event.Status != "blocked" || event.Reason != "unbound_api_key" {
+		t.Fatalf("event = %#v, want blocked unbound_api_key", event)
+	}
+}
+
 func TestSchedulerIgnoresHelperAPIKeyHashWithoutTrustedProxyKey(t *testing.T) {
 	app := NewApp()
 	helperKeyHash := hashAPIKey("sk-helper-local")

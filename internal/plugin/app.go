@@ -19,6 +19,7 @@ type App struct {
 	mu               sync.RWMutex
 	state            State
 	stateFile        string
+	saveMu           sync.Mutex
 	schedulerMu      sync.Mutex
 	schedulerCursors map[string]int
 	eventsMu         sync.RWMutex
@@ -138,6 +139,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	a.clearExpiredConcurrencySlots(now)
 	apiKey := extractAPIKey(req.Options.Headers)
 	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
+	trustedProxyRequest := apiKeyHash != ""
 	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
 		a.recordSchedulerEvent(req, nil, nil, nil, nil, "blocked", "untrusted_proxy_key", http.StatusForbidden, now)
 		return schedulerBlocked("untrusted_proxy_key", "helper API key hash header requires a trusted CPA proxy key", http.StatusForbidden)
@@ -154,6 +156,10 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	allowedModels := a.poolModelsLocked(pool)
 	a.mu.RUnlock()
 	if !ok {
+		if trustedProxyRequest {
+			a.recordSchedulerEvent(req, nil, nil, nil, nil, "blocked", "unbound_api_key", http.StatusForbidden, now)
+			return schedulerBlocked("auth_pool_required", "trusted proxy request has no auth pool binding", http.StatusForbidden)
+		}
 		a.recordSchedulerEvent(req, nil, nil, nil, nil, "ignored", "unbound_api_key", 0, now)
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
@@ -598,6 +604,8 @@ func (a *App) load() error {
 }
 
 func (a *App) save() error {
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
 	a.mu.RLock()
 	state := cloneState(a.state)
 	stateFile := a.stateFile

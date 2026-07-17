@@ -1,22 +1,22 @@
-# CPA Auth Pool 0.1.23
+# CPA Auth Pool 0.1.24
 
-This release adds bounded in-memory monitoring events for auth-pool scheduling and upstream completion, exposed to CPA-Helper-s for diagnosing pool selection failures.
+This release hardens trusted CPA-Helper proxy requests and serializes plugin state persistence.
 
-## Monitoring
+## Security
 
-- Record scheduler decisions as `selected`, `blocked`, or `ignored`, including pool, model, provider, user, candidate counts and selected auth ID.
-- Record upstream completion as `success` or `failed`, including the final auth ID, HTTP status and a bounded failure reason.
-- Include up to 25 candidate account samples with provider, priority, status and detected account types.
-- Keep the newest 500 events in an O(1) in-memory ring buffer; events are not written to the plugin state file.
-- Add management endpoints:
-  - `GET /v0/management/plugins/cpa-auth-pool/events`
-  - `DELETE /v0/management/plugins/cpa-auth-pool/events`
+- A request carrying a trusted `X-CPA-Helper-API-Key-Hash` header now fails closed when the hash has no plugin binding.
+- Inconsistent Helper/Plugin state can no longer fall back to unrelated global CPA accounts.
+- Direct CPA API keys without a Helper proxy header keep the existing unbound-key scheduling behavior.
 
-## Security and retention
+## State safety
 
-- API keys, Management Keys, Authorization headers and request bodies are not recorded.
-- Failure reasons are limited to 320 characters.
-- Events disappear when CPA restarts or the event buffer is cleared.
+- Serialize state saves so concurrent management mutations cannot publish snapshots out of order.
+- Retain the existing deep-copy, temporary-file, fsync and atomic-rename persistence path.
+
+## Compatibility
+
+- Use with CPA-Helper-s `v0.3.26` or newer.
+- Use a CLIProxyAPI build containing the auth-pool priority-filter ordering fix.
 
 ## Validation
 
