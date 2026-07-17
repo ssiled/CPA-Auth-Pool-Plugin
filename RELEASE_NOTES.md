@@ -1,4 +1,4 @@
-# CPA Auth Pool 0.1.21
+# CPA Auth Pool 0.1.22
 
 This release fixes dynamic auth pools that displayed healthy accounts in CPA-Helper but returned `503 bound auth pool has no eligible auth candidates` at request time.
 

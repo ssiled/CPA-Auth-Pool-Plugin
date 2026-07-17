@@ -38,7 +38,7 @@ func TestConfigureReadsHostConfigYAML(t *testing.T) {
 }
 
 func TestConfigureDefaultStateFileUsesPluginsDirectory(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdirForTest(t, t.TempDir())
 	app := NewApp()
 
 	if err := app.configure(nil); err != nil {
@@ -50,7 +50,7 @@ func TestConfigureDefaultStateFileUsesPluginsDirectory(t *testing.T) {
 }
 
 func TestConfigureMigratesLegacyStateFile(t *testing.T) {
-	t.Chdir(t.TempDir())
+	chdirForTest(t, t.TempDir())
 	legacyRaw := []byte(`{"pools":[{"id":"plus","name":"Plus","auth_ids":["auth-a"],"enabled":true}],"key_bindings":{},"auth_models":{}}`)
 	if err := os.WriteFile(legacyStateFile, legacyRaw, 0o600); err != nil {
 		t.Fatalf("write legacy state: %v", err)
@@ -66,6 +66,22 @@ func TestConfigureMigratesLegacyStateFile(t *testing.T) {
 	if _, err := os.Stat(filepath.Join("plugins", legacyStateFile)); err != nil {
 		t.Fatalf("migrated state file missing: %v", err)
 	}
+}
+
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
 }
 
 func decodeSchedulerResponse(t *testing.T, raw []byte) SchedulerPickResponse {
