@@ -244,6 +244,7 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	pool.ID = strings.TrimSpace(pool.ID)
 	pool.Name = strings.TrimSpace(pool.Name)
 	pool.AuthIDs = cleanStringList(pool.AuthIDs)
+	pool.ResolvedAuthIDs = cleanStringList(pool.ResolvedAuthIDs)
 	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
 	pool.Models = cleanModelList(pool.Models)
 	if pool.ID == "" || pool.Name == "" {
@@ -253,12 +254,16 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(body, &raw)
 	_, modelsProvided := raw["models"]
+	_, resolvedAuthIDsProvided := raw["resolved_auth_ids"]
 	a.mu.Lock()
 	found := false
 	for i := range a.state.Pools {
 		if a.state.Pools[i].ID == pool.ID {
 			if !modelsProvided {
 				pool.Models = append([]string(nil), a.state.Pools[i].Models...)
+			}
+			if !resolvedAuthIDsProvided {
+				pool.ResolvedAuthIDs = append([]string(nil), a.state.Pools[i].ResolvedAuthIDs...)
 			}
 			a.state.Pools[i] = pool
 			found = true
@@ -301,8 +306,9 @@ func (a *App) deletePool(id string) ManagementResponse {
 }
 
 type authModelsPayload struct {
-	AuthModels map[string][]string `json:"auth_models"`
-	PoolModels map[string][]string `json:"pool_models"`
+	AuthModels          map[string][]string `json:"auth_models"`
+	PoolModels          map[string][]string `json:"pool_models"`
+	PoolResolvedAuthIDs map[string][]string `json:"pool_resolved_auth_ids"`
 }
 
 func (a *App) syncAuthModels(body []byte) ManagementResponse {
@@ -310,6 +316,10 @@ func (a *App) syncAuthModels(body []byte) ManagementResponse {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(body, &raw)
+	_, authModelsProvided := raw["auth_models"]
+	_, poolModelsProvided := raw["pool_models"]
 	next := make(map[string][]string, len(payload.AuthModels))
 	for authID, models := range payload.AuthModels {
 		authID = strings.TrimSpace(authID)
@@ -326,14 +336,29 @@ func (a *App) syncAuthModels(body []byte) ManagementResponse {
 		}
 		nextPoolModels[poolID] = cleanModelList(models)
 	}
-	a.mu.Lock()
-	a.state.AuthModels = next
-	for i := range a.state.Pools {
-		if models, ok := nextPoolModels[a.state.Pools[i].ID]; ok {
-			a.state.Pools[i].Models = models
+	nextPoolResolvedAuthIDs := make(map[string][]string, len(payload.PoolResolvedAuthIDs))
+	for poolID, authIDs := range payload.PoolResolvedAuthIDs {
+		poolID = strings.TrimSpace(poolID)
+		if poolID == "" {
 			continue
 		}
-		a.state.Pools[i].Models = cleanModelList(poolModelListFromAuthModels(a.state.Pools[i].AuthIDs, next))
+		nextPoolResolvedAuthIDs[poolID] = cleanStringList(authIDs)
+	}
+	a.mu.Lock()
+	if authModelsProvided {
+		a.state.AuthModels = next
+	}
+	for i := range a.state.Pools {
+		if authIDs, ok := nextPoolResolvedAuthIDs[a.state.Pools[i].ID]; ok {
+			a.state.Pools[i].ResolvedAuthIDs = authIDs
+		}
+		if poolModelsProvided {
+			if models, ok := nextPoolModels[a.state.Pools[i].ID]; ok {
+				a.state.Pools[i].Models = models
+				continue
+			}
+			a.state.Pools[i].Models = cleanModelList(poolModelListFromAuthModels(poolCandidateAuthIDs(a.state.Pools[i]), next))
+		}
 	}
 	a.mu.Unlock()
 	if err := a.save(); err != nil {

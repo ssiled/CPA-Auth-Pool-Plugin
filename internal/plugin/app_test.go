@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -149,6 +150,71 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	resp := decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "auth-b" {
 		t.Fatalf("response = %+v, want auth-b", resp)
+	}
+}
+
+func TestSchedulerRoundRobinsSamePriorityCandidates(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-round-robin"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool-a", Name: "Pool A", Enabled: true, AuthIDs: []string{"auth-a", "auth-b"}, Models: []string{"gpt-test"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-a"}}
+
+	req := SchedulerPickRequest{
+		Provider: "openai",
+		Model:    "gpt-test",
+		Options:  SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "auth-b", Provider: "openai", Priority: 100},
+			{ID: "auth-a", Provider: "openai", Priority: 100},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	want := []string{"auth-a", "auth-b", "auth-a"}
+	for index, wantAuthID := range want {
+		raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeSchedulerResponse(t, raw)
+		if !resp.Handled || resp.AuthID != wantAuthID {
+			t.Fatalf("response %d = %+v, want %s", index+1, resp, wantAuthID)
+		}
+	}
+}
+
+func TestSchedulerUsesResolvedAuthIDWithoutCandidateTierMetadata(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-resolved"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{
+		ID:              "002",
+		Name:            "plus/team",
+		Enabled:         true,
+		AccountTypes:    []string{"k12", "team", "plus"},
+		ResolvedAuthIDs: []string{"karenmclean0894+go1@gmail.com.json"},
+		Models:          []string{"gpt-5.5"},
+	}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "002"}}
+
+	req := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5.5",
+		Options:  SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{
+			ID:       "karenmclean0894+go1@gmail.com.json",
+			Provider: "codex",
+			Priority: 22,
+		}},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "karenmclean0894+go1@gmail.com.json" {
+		t.Fatalf("response = %+v, want resolved k12 account", resp)
 	}
 }
 
@@ -705,5 +771,106 @@ func TestSyncAuthModelsAcceptsPoolModels(t *testing.T) {
 	}
 	if len(app.state.Pools[0].Models) != 1 || app.state.Pools[0].Models[0] != "gpt-type" {
 		t.Fatalf("pool models = %#v, want gpt-type", app.state.Pools[0].Models)
+	}
+}
+
+func TestSyncAuthModelsUpdatesResolvedAuthIDs(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "auth-pool-state.json")
+	app.state.Pools = []PoolConfig{{ID: "002", Name: "plus/team", Enabled: true, AccountTypes: []string{"k12", "team", "plus"}}}
+
+	resp := app.syncAuthModels([]byte(`{
+		"auth_models":{"karen.json":["gpt-5.5"]},
+		"pool_models":{"002":["gpt-5.5"]},
+		"pool_resolved_auth_ids":{"002":["karen.json"]}
+	}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if !reflect.DeepEqual(app.state.Pools[0].ResolvedAuthIDs, []string{"karen.json"}) {
+		t.Fatalf("resolved auth ids = %#v, want karen.json", app.state.Pools[0].ResolvedAuthIDs)
+	}
+}
+
+func TestSyncResolvedAuthIDsPreservesLastGoodModels(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "auth-pool-state.json")
+	app.state.AuthModels = map[string][]string{"old.json": {"gpt-old"}}
+	app.state.Pools = []PoolConfig{{
+		ID:              "002",
+		Name:            "plus/team",
+		Enabled:         true,
+		ResolvedAuthIDs: []string{"old.json"},
+		Models:          []string{"gpt-old"},
+	}}
+
+	resp := app.syncAuthModels([]byte(`{
+		"pool_resolved_auth_ids":{"002":["karen.json"]}
+	}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if !reflect.DeepEqual(app.state.Pools[0].ResolvedAuthIDs, []string{"karen.json"}) {
+		t.Fatalf("resolved auth ids = %#v, want karen.json", app.state.Pools[0].ResolvedAuthIDs)
+	}
+	if !reflect.DeepEqual(app.state.Pools[0].Models, []string{"gpt-old"}) || !reflect.DeepEqual(app.state.AuthModels["old.json"], []string{"gpt-old"}) {
+		t.Fatalf("last-good models were overwritten: pool=%#v auth=%#v", app.state.Pools[0].Models, app.state.AuthModels)
+	}
+}
+
+func TestSaveAtomicallyReplacesExistingStateFile(t *testing.T) {
+	app := NewApp()
+	dir := t.TempDir()
+	app.stateFile = filepath.Join(dir, "auth-pool-state.json")
+	if err := os.WriteFile(app.stateFile, []byte(`{"stale":true}`), 0o600); err != nil {
+		t.Fatalf("seed state file: %v", err)
+	}
+	app.state.Pools = []PoolConfig{{
+		ID:              "002",
+		Name:            "plus/team",
+		Enabled:         true,
+		ResolvedAuthIDs: []string{"karen.json"},
+	}}
+
+	if err := app.save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	raw, err := os.ReadFile(app.stateFile)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if len(state.Pools) != 1 || !reflect.DeepEqual(state.Pools[0].ResolvedAuthIDs, []string{"karen.json"}) {
+		t.Fatalf("saved state = %#v, want resolved pool", state)
+	}
+	tempFiles, err := filepath.Glob(filepath.Join(dir, ".auth-pool-state.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(tempFiles) != 0 {
+		t.Fatalf("temporary files remain: %#v", tempFiles)
+	}
+}
+
+func TestCloneStateDetachesNestedCollections(t *testing.T) {
+	state := State{
+		Pools:                  []PoolConfig{{ID: "002", AuthIDs: []string{"manual"}, ResolvedAuthIDs: []string{"resolved"}, Models: []string{"gpt"}}},
+		KeyBindings:            map[string]KeyBinding{"hash": {APIKeyHash: "hash", PoolID: "002"}},
+		AuthModels:             map[string][]string{"resolved": {"gpt"}},
+		ProxyKeyHashes:         []string{"proxy"},
+		CodexConcurrencyLimits: map[string]int{"plus": 2},
+		ConcurrencySlots:       map[string]ConcurrencySlot{"resolved": {AuthID: "resolved", Count: 1}},
+	}
+	cloned := cloneState(state)
+	state.Pools[0].ResolvedAuthIDs[0] = "changed"
+	state.AuthModels["resolved"][0] = "changed"
+	state.ProxyKeyHashes[0] = "changed"
+	state.CodexConcurrencyLimits["plus"] = 9
+
+	if cloned.Pools[0].ResolvedAuthIDs[0] != "resolved" || cloned.AuthModels["resolved"][0] != "gpt" || cloned.ProxyKeyHashes[0] != "proxy" || cloned.CodexConcurrencyLimits["plus"] != 2 {
+		t.Fatalf("clone changed with source: %#v", cloned)
 	}
 }

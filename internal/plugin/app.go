@@ -9,15 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type App struct {
-	mu        sync.RWMutex
-	state     State
-	stateFile string
+	mu               sync.RWMutex
+	state            State
+	stateFile        string
+	schedulerMu      sync.Mutex
+	schedulerCursors map[string]int
 }
 
 const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
@@ -34,13 +37,14 @@ type State struct {
 }
 
 type PoolConfig struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Description  string   `json:"description,omitempty"`
-	AuthIDs      []string `json:"auth_ids"`
-	AccountTypes []string `json:"account_types,omitempty"`
-	Models       []string `json:"models,omitempty"`
-	Enabled      bool     `json:"enabled"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Description     string   `json:"description,omitempty"`
+	AuthIDs         []string `json:"auth_ids"`
+	ResolvedAuthIDs []string `json:"resolved_auth_ids,omitempty"`
+	AccountTypes    []string `json:"account_types,omitempty"`
+	Models          []string `json:"models,omitempty"`
+	Enabled         bool     `json:"enabled"`
 }
 
 type KeyBinding struct {
@@ -51,7 +55,10 @@ type KeyBinding struct {
 }
 
 func NewApp() *App {
-	return &App{state: State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}}}
+	return &App{
+		state:            State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}},
+		schedulerCursors: map[string]int{},
+	}
 }
 
 func (a *App) Shutdown() {
@@ -152,7 +159,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
-	for _, id := range pool.AuthIDs {
+	for _, id := range poolCandidateAuthIDs(pool) {
 		if id = strings.TrimSpace(id); id != "" {
 			allowed[id] = struct{}{}
 		}
@@ -209,19 +216,62 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return matched[i].Priority > matched[j].Priority
 	})
 	blockedByConcurrency := false
-	for _, selected := range matched {
-		if tier := candidateTiers[selected.ID]; tier != "" {
-			if !a.reserveConcurrencySlotIfAvailable(selected, tier, now) {
-				blockedByConcurrency = true
-				continue
-			}
+	for groupStart := 0; groupStart < len(matched); {
+		groupEnd := groupStart + 1
+		for groupEnd < len(matched) && matched[groupEnd].Priority == matched[groupStart].Priority {
+			groupEnd++
 		}
-		return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
+		group := matched[groupStart:groupEnd]
+		offset := a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, matched[groupStart].Priority), len(group))
+		for index := 0; index < len(group); index++ {
+			selected := group[(offset+index)%len(group)]
+			if tier := candidateTiers[selected.ID]; tier != "" {
+				if !a.reserveConcurrencySlotIfAvailable(selected, tier, now) {
+					blockedByConcurrency = true
+					continue
+				}
+			}
+			return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
+		}
+		groupStart = groupEnd
 	}
 	if blockedByConcurrency {
 		return schedulerBlocked("auth_pool_busy", "bound auth pool accounts are at concurrency limit", http.StatusTooManyRequests)
 	}
 	return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no available auth candidates", http.StatusServiceUnavailable)
+}
+
+func poolCandidateAuthIDs(pool PoolConfig) []string {
+	ids := make([]string, 0, len(pool.AuthIDs)+len(pool.ResolvedAuthIDs))
+	ids = append(ids, pool.AuthIDs...)
+	ids = append(ids, pool.ResolvedAuthIDs...)
+	return ids
+}
+
+func schedulerCursorKey(poolID, provider, model string, priority int) string {
+	return strings.ToLower(strings.TrimSpace(poolID)) + "\x00" +
+		strings.ToLower(strings.TrimSpace(provider)) + "\x00" +
+		normalizeModelID(model) + "\x00" + strconv.Itoa(priority)
+}
+
+func (a *App) nextSchedulerCursor(key string, size int) int {
+	if size <= 1 {
+		return 0
+	}
+	a.schedulerMu.Lock()
+	defer a.schedulerMu.Unlock()
+	if a.schedulerCursors == nil {
+		a.schedulerCursors = map[string]int{}
+	}
+	if _, exists := a.schedulerCursors[key]; !exists && len(a.schedulerCursors) >= 4096 {
+		a.schedulerCursors = map[string]int{}
+	}
+	cursor := a.schedulerCursors[key]
+	if cursor >= 2_147_483_640 {
+		cursor = 0
+	}
+	a.schedulerCursors[key] = cursor + 1
+	return cursor % size
 }
 
 func schedulerBlocked(code, message string, status int) ([]byte, error) {
@@ -536,7 +586,7 @@ func (a *App) load() error {
 
 func (a *App) save() error {
 	a.mu.RLock()
-	state := a.state
+	state := cloneState(a.state)
 	stateFile := a.stateFile
 	a.mu.RUnlock()
 	if stateFile == "" {
@@ -547,10 +597,63 @@ func (a *App) save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil && filepath.Dir(stateFile) != "." {
+	dir := filepath.Dir(stateFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil && dir != "." {
 		return err
 	}
-	return os.WriteFile(stateFile, raw, 0o600)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(stateFile)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(raw); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, stateFile)
+}
+
+func cloneState(state State) State {
+	cloned := State{
+		Pools:                  make([]PoolConfig, len(state.Pools)),
+		KeyBindings:            make(map[string]KeyBinding, len(state.KeyBindings)),
+		AuthModels:             make(map[string][]string, len(state.AuthModels)),
+		ProxyKeyHashes:         append([]string(nil), state.ProxyKeyHashes...),
+		CodexConcurrencyLimits: make(map[string]int, len(state.CodexConcurrencyLimits)),
+		ConcurrencySlots:       make(map[string]ConcurrencySlot, len(state.ConcurrencySlots)),
+	}
+	for index, pool := range state.Pools {
+		pool.AuthIDs = append([]string(nil), pool.AuthIDs...)
+		pool.ResolvedAuthIDs = append([]string(nil), pool.ResolvedAuthIDs...)
+		pool.AccountTypes = append([]string(nil), pool.AccountTypes...)
+		pool.Models = append([]string(nil), pool.Models...)
+		cloned.Pools[index] = pool
+	}
+	for hash, binding := range state.KeyBindings {
+		cloned.KeyBindings[hash] = binding
+	}
+	for authID, models := range state.AuthModels {
+		cloned.AuthModels[authID] = append([]string(nil), models...)
+	}
+	for tier, limit := range state.CodexConcurrencyLimits {
+		cloned.CodexConcurrencyLimits[tier] = limit
+	}
+	for authID, slot := range state.ConcurrencySlots {
+		cloned.ConcurrencySlots[authID] = slot
+	}
+	return cloned
 }
 
 func hashAPIKey(apiKey string) string {

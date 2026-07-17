@@ -31,6 +31,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Run tests
+        run: go test ./...
+
       - name: Install CGO toolchain
         shell: bash
         run: |
@@ -47,7 +50,11 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            version="0.1.20"
+            version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' internal/plugin/types.go | head -n 1)"
+          fi
+          if [ -z "$version" ]; then
+            echo "Unable to resolve plugin version" >&2
+            exit 1
           fi
 
           package_dir="$RUNNER_TEMP/cpa-auth-pool-package"
@@ -80,6 +87,9 @@ jobs:
     if: github.ref_type == 'tag'
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Download artifacts
         uses: actions/download-artifact@v6
         with:
@@ -98,7 +108,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          notes_args=(--generate-notes)
+          if [ -f RELEASE_NOTES.md ]; then
+            notes_args=(--notes-file RELEASE_NOTES.md)
+          fi
+
           gh release create "$GITHUB_REF_NAME" release/* \
             --target "$GITHUB_SHA" \
             --title "CPA Auth Pool ${GITHUB_REF_NAME#v}" \
-            --notes "CPA scheduler plugin for binding API keys to auth pools. Add https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json to plugins.store-sources."
+            "${notes_args[@]}"

@@ -61,7 +61,7 @@ func (a *App) poolModelsLocked(pool PoolConfig) map[string]struct{} {
 	if len(a.state.AuthModels) == 0 {
 		return models
 	}
-	for _, authID := range pool.AuthIDs {
+	for _, authID := range poolCandidateAuthIDs(pool) {
 		for _, model := range a.state.AuthModels[strings.TrimSpace(authID)] {
 			if normalized := normalizeModelID(model); normalized != "" {
 				models[normalized] = struct{}{}
