@@ -11,7 +11,7 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.22"
+	Version       = "0.1.23"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
@@ -70,6 +70,7 @@ type Capabilities struct {
 type SchedulerPickRequest struct {
 	Provider   string                   `json:"Provider,omitempty"`
 	Model      string                   `json:"Model"`
+	Stream     bool                     `json:"Stream,omitempty"`
 	Options    SchedulerPickOptions     `json:"Options"`
 	Candidates []SchedulerAuthCandidate `json:"Candidates"`
 }

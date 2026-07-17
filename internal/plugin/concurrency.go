@@ -24,6 +24,7 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return OKEnvelope(map[string]any{})
 	}
+	a.recordUsageEvent(record)
 	if authID := strings.TrimSpace(record.AuthID); authID != "" {
 		a.releaseConcurrencySlot(authID)
 	}

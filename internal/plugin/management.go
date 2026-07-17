@@ -22,6 +22,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		{Method: http.MethodDelete, Path: base + "/bindings", Description: "Remove an API key binding."},
 		{Method: http.MethodPost, Path: base + "/codex-concurrency-limits", Description: "Configure per-tier Codex concurrency limits."},
 		{Method: http.MethodDelete, Path: base + "/concurrency-slots", Description: "Reset one or all in-flight concurrency slots."},
+		{Method: http.MethodGet, Path: base + "/events", Description: "List recent scheduler and upstream completion events."},
+		{Method: http.MethodDelete, Path: base + "/events", Description: "Clear recent scheduler and upstream completion events."},
 	}}
 }
 
@@ -55,6 +57,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.updateCodexConcurrencyLimits(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/concurrency-slots":
 		return OKEnvelope(a.deleteConcurrencySlot(req))
+	case req.Method == http.MethodGet && path == base+"/events":
+		return OKEnvelope(jsonResponse(http.StatusOK, a.pluginEventSnapshot(eventLimitFromRequest(req))))
+	case req.Method == http.MethodDelete && path == base+"/events":
+		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"cleared": a.clearPluginEvents()}))
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "route not found"))
 	}

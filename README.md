@@ -9,6 +9,7 @@
 - At request time, the plugin hashes the incoming API key and schedules only auth candidates from the bound pool.
 - Before CPA schedules a request, the plugin routes bound Codex/Gemini/Grok/Claude/Antigravity pools to their matching provider so CPA will not fall back to unrelated providers for that key.
 - If a key is bound to a pool but that pool has no matching candidate, the plugin blocks fallback to other pools.
+- Keep a bounded in-memory event log of scheduler decisions and upstream completion status for troubleshooting in CPA-Helper-s.
 - API keys without pool bindings keep CPA default scheduling behavior.
 
 ## Build
@@ -46,6 +47,7 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 /v0/management/plugins/cpa-auth-pool/status
 /v0/management/plugins/cpa-auth-pool/pools
 /v0/management/plugins/cpa-auth-pool/bindings
+/v0/management/plugins/cpa-auth-pool/events
 ```
 
 ## Use from CPA-Helper-s
@@ -63,12 +65,13 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 - Bound pools intentionally fail closed: empty or unavailable pools do not fall back to other pools.
 - Back up `plugins/cpa-auth-pool-state.json` because it stores pool definitions and key bindings used by CPA runtime.
 - Versions 0.1.18 and newer migrate a legacy `cpa-auth-pool-state.json` file into `plugins/cpa-auth-pool-state.json` when the new file is missing.
+- Monitoring events are kept only in memory, capped at 500 entries, and disappear when CPA restarts or the buffer is cleared.
 
 
 ## Plugin Store URL
 
-`	ext
+```text
 https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json
-` 
+```
 
 

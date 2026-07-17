@@ -21,6 +21,10 @@ type App struct {
 	stateFile        string
 	schedulerMu      sync.Mutex
 	schedulerCursors map[string]int
+	eventsMu         sync.RWMutex
+	events           []PluginEvent
+	eventStart       int
+	nextEventID      uint64
 }
 
 const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
@@ -58,6 +62,7 @@ func NewApp() *App {
 	return &App{
 		state:            State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}},
 		schedulerCursors: map[string]int{},
+		events:           make([]PluginEvent, 0, pluginEventCapacity),
 	}
 }
 
@@ -134,6 +139,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	apiKey := extractAPIKey(req.Options.Headers)
 	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
 	if apiKeyHash != "" && !a.isTrustedProxyAPIKey(apiKey) {
+		a.recordSchedulerEvent(req, nil, nil, nil, nil, "blocked", "untrusted_proxy_key", http.StatusForbidden, now)
 		return schedulerBlocked("untrusted_proxy_key", "helper API key hash header requires a trusted CPA proxy key", http.StatusForbidden)
 	}
 	if apiKeyHash == "" && apiKey != "" {
@@ -148,13 +154,16 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	allowedModels := a.poolModelsLocked(pool)
 	a.mu.RUnlock()
 	if !ok {
+		a.recordSchedulerEvent(req, nil, nil, nil, nil, "ignored", "unbound_api_key", 0, now)
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
 	if !poolOK || !pool.Enabled {
+		a.recordSchedulerEvent(req, &binding, &pool, nil, nil, "blocked", "auth_pool_unavailable", http.StatusServiceUnavailable, now)
 		return schedulerBlocked("auth_pool_unavailable", "bound auth pool is unavailable", http.StatusServiceUnavailable)
 	}
 	if requestedModel := strings.TrimSpace(req.Model); requestedModel != "" {
 		if _, ok := allowedModels[normalizeModelID(requestedModel)]; !ok {
+			a.recordSchedulerEvent(req, &binding, &pool, nil, nil, "blocked", "model_not_allowed", http.StatusForbidden, now)
 			return schedulerBlocked("model_not_allowed", "requested model is outside the bound auth pool", http.StatusForbidden)
 		}
 	}
@@ -207,6 +216,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 	}
 	if len(matched) == 0 {
+		a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "no_eligible_candidates", http.StatusServiceUnavailable, now)
 		return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no eligible auth candidates", http.StatusServiceUnavailable)
 	}
 	sort.Slice(matched, func(i, j int) bool {
@@ -231,13 +241,16 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 					continue
 				}
 			}
+			a.recordSchedulerEvent(req, &binding, &pool, matched, &selected, "selected", "", http.StatusOK, now)
 			return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 		}
 		groupStart = groupEnd
 	}
 	if blockedByConcurrency {
+		a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "auth_pool_busy", http.StatusTooManyRequests, now)
 		return schedulerBlocked("auth_pool_busy", "bound auth pool accounts are at concurrency limit", http.StatusTooManyRequests)
 	}
+	a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "no_available_candidates", http.StatusServiceUnavailable, now)
 	return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no available auth candidates", http.StatusServiceUnavailable)
 }
 
