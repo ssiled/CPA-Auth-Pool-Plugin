@@ -47,7 +47,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            version="0.1.13"
+            version="0.1.14"
           fi
 
           package_dir="$RUNNER_TEMP/cpa-auth-pool-package"
@@ -102,4 +102,3 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "CPA Auth Pool ${GITHUB_REF_NAME#v}" \
             --notes "CPA scheduler plugin for binding API keys to auth pools. Add https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json to plugins.store-sources."
-

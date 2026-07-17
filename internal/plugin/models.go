@@ -54,7 +54,7 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 func (a *App) poolModelsLocked(pool PoolConfig) map[string]struct{} {
 	models := make(map[string]struct{})
 	for _, model := range pool.Models {
-		if normalized := strings.TrimSpace(model); normalized != "" {
+		if normalized := normalizeModelID(model); normalized != "" {
 			models[normalized] = struct{}{}
 		}
 	}
@@ -63,7 +63,7 @@ func (a *App) poolModelsLocked(pool PoolConfig) map[string]struct{} {
 	}
 	for _, authID := range pool.AuthIDs {
 		for _, model := range a.state.AuthModels[strings.TrimSpace(authID)] {
-			if normalized := strings.TrimSpace(model); normalized != "" {
+			if normalized := normalizeModelID(model); normalized != "" {
 				models[normalized] = struct{}{}
 			}
 		}
@@ -144,11 +144,12 @@ func filterModelPayload(raw any, allowed map[string]struct{}) (any, bool) {
 func filterModelItems(items []any, allowed map[string]struct{}) ([]any, bool) {
 	filtered := make([]any, 0, len(items))
 	for _, item := range items {
-		if modelIDFromItem(item) == "" {
+		modelID := normalizeModelID(modelIDFromItem(item))
+		if modelID == "" {
 			filtered = append(filtered, item)
 			continue
 		}
-		if _, ok := allowed[modelIDFromItem(item)]; ok {
+		if _, ok := allowed[modelID]; ok {
 			filtered = append(filtered, item)
 		}
 	}
@@ -156,6 +157,10 @@ func filterModelItems(items []any, allowed map[string]struct{}) ([]any, bool) {
 		return items, false
 	}
 	return filtered, true
+}
+
+func normalizeModelID(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func modelIDFromItem(item any) string {

@@ -91,6 +91,30 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	}
 }
 
+func TestSchedulerDoesNotTreatOpenAICompatibleAsCodexPool(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-codex-pool"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "codex", Name: "Codex", Enabled: true, AccountTypes: []string{"codex"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "codex"}}
+
+	req := SchedulerPickRequest{
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "https://vip.j3gb.com", Provider: "openai-compatible-https://vip.j3gb.com", Priority: 100},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSchedulerResponse(t, raw)
+	if !resp.Handled || resp.AuthID != "" {
+		t.Fatalf("response = %+v, want fail-closed empty AuthID", resp)
+	}
+}
+
 func TestSchedulerUsesHelperAPIKeyHashHeader(t *testing.T) {
 	app := NewApp()
 	helperKeyHash := hashAPIKey("sk-helper-local")

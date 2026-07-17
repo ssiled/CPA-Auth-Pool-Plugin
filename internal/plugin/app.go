@@ -136,7 +136,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return OKEnvelope(SchedulerPickResponse{Handled: true})
 	}
 	if requestedModel := strings.TrimSpace(req.Model); requestedModel != "" {
-		if _, ok := allowedModels[requestedModel]; !ok {
+		if _, ok := allowedModels[normalizeModelID(requestedModel)]; !ok {
 			return OKEnvelope(SchedulerPickResponse{Handled: true})
 		}
 	}
@@ -220,7 +220,7 @@ func accountTypeAliases(value string) []string {
 		aliases = append(aliases, "grok")
 	case strings.Contains(normalized, "claude") || strings.Contains(normalized, "anthropic"):
 		aliases = append(aliases, "claude")
-	case strings.Contains(normalized, "codex") || strings.Contains(normalized, "openai"):
+	case normalized == "codex" || strings.Contains(normalized, "codex") || strings.Contains(normalized, "chatgpt"):
 		aliases = append(aliases, "codex")
 	}
 	return aliases
@@ -228,6 +228,9 @@ func accountTypeAliases(value string) []string {
 
 func normalizeAccountType(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
+	if strings.HasPrefix(value, "openai-compatible") || strings.HasPrefix(value, "openai_compatible") || strings.HasPrefix(value, "openai compatible") {
+		return "openai_compatible"
+	}
 	value = strings.NewReplacer("-", "_", " ", "_", ".", "_", "@", "_", "/", "_", "\\", "_").Replace(value)
 	parts := strings.FieldsFunc(value, func(r rune) bool { return r == '_' })
 	cleaned := []string{}
