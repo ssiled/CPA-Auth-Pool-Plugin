@@ -37,7 +37,7 @@ plugins:
     cpa-auth-pool:
       enabled: true
       priority: 20
-      state_file: "cpa-auth-pool-state.json"
+      state_file: "plugins/cpa-auth-pool-state.json"
 ```
 
 Restart CPA. CPA-Helper-s uses these management endpoints:
@@ -61,7 +61,8 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 - Pool account IDs must match CPA scheduler candidate auth IDs. The UI currently uses account names from CPA-Helper-s account inspection.
 - Provider routing depends on pool account types. Prefer type-based pools such as `free`, `plus`, `team`, `gemini`, or `grok` when you need strict provider isolation.
 - Bound pools intentionally fail closed: empty or unavailable pools do not fall back to other pools.
-- Back up `cpa-auth-pool-state.json` because it stores pool definitions and key bindings used by CPA runtime.
+- Back up `plugins/cpa-auth-pool-state.json` because it stores pool definitions and key bindings used by CPA runtime.
+- Versions 0.1.18 and newer migrate a legacy `cpa-auth-pool-state.json` file into `plugins/cpa-auth-pool-state.json` when the new file is missing.
 
 
 ## Plugin Store URL

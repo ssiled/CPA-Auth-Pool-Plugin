@@ -3,6 +3,7 @@ package plugin
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -32,6 +33,37 @@ func TestConfigureReadsHostConfigYAML(t *testing.T) {
 	}
 	if app.stateFile != stateFile {
 		t.Fatalf("stateFile = %q, want %q", app.stateFile, stateFile)
+	}
+}
+
+func TestConfigureDefaultStateFileUsesPluginsDirectory(t *testing.T) {
+	t.Chdir(t.TempDir())
+	app := NewApp()
+
+	if err := app.configure(nil); err != nil {
+		t.Fatalf("configure failed: %v", err)
+	}
+	if app.stateFile != filepath.Join("plugins", legacyStateFile) {
+		t.Fatalf("stateFile = %q, want plugins state file", app.stateFile)
+	}
+}
+
+func TestConfigureMigratesLegacyStateFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	legacyRaw := []byte(`{"pools":[{"id":"plus","name":"Plus","auth_ids":["auth-a"],"enabled":true}],"key_bindings":{},"auth_models":{}}`)
+	if err := os.WriteFile(legacyStateFile, legacyRaw, 0o600); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+	app := NewApp()
+
+	if err := app.configure(nil); err != nil {
+		t.Fatalf("configure failed: %v", err)
+	}
+	if len(app.state.Pools) != 1 || app.state.Pools[0].ID != "plus" {
+		t.Fatalf("pools = %#v, want migrated plus pool", app.state.Pools)
+	}
+	if _, err := os.Stat(filepath.Join("plugins", legacyStateFile)); err != nil {
+		t.Fatalf("migrated state file missing: %v", err)
 	}
 }
 

@@ -22,6 +22,8 @@ type App struct {
 
 const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
 
+const legacyStateFile = "cpa-auth-pool-state.json"
+
 type State struct {
 	Pools                  []PoolConfig               `json:"pools"`
 	KeyBindings            map[string]KeyBinding      `json:"key_bindings"`
@@ -81,7 +83,7 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func (a *App) configure(raw []byte) error {
-	stateFile := "cpa-auth-pool-state.json"
+	stateFile := defaultStateFile()
 	if len(raw) > 0 {
 		var req LifecycleRequest
 		if err := json.Unmarshal(raw, &req); err == nil && strings.Contains(string(req.ConfigYAML), "state_file") {
@@ -404,11 +406,72 @@ func (a *App) poolLocked(id string) (PoolConfig, bool) {
 	return PoolConfig{}, false
 }
 
+func defaultStateFile() string {
+	return filepath.Join("plugins", legacyStateFile)
+}
+
+func resolveStateFile(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == legacyStateFile {
+		return defaultStateFile()
+	}
+	return value
+}
+
+func legacyStateCandidates(stateFile string) []string {
+	seen := map[string]struct{}{}
+	candidates := []string{}
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || path == stateFile {
+			return
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		candidates = append(candidates, path)
+	}
+	add(legacyStateFile)
+	add(filepath.Join(".", legacyStateFile))
+	add(filepath.Join(filepath.Dir(stateFile), legacyStateFile))
+	return candidates
+}
+
+func migrateLegacyStateFile(stateFile string) error {
+	if _, err := os.Stat(stateFile); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, candidate := range legacyStateCandidates(stateFile) {
+		raw, err := os.ReadFile(candidate)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if len(strings.TrimSpace(string(raw))) == 0 {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil && filepath.Dir(stateFile) != "." {
+			return err
+		}
+		return os.WriteFile(stateFile, raw, 0o600)
+	}
+	return nil
+}
+
 func (a *App) load() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.stateFile == "" {
-		a.stateFile = "cpa-auth-pool-state.json"
+		a.stateFile = defaultStateFile()
+	}
+	a.stateFile = resolveStateFile(a.stateFile)
+	if err := migrateLegacyStateFile(a.stateFile); err != nil {
+		return err
 	}
 	raw, err := os.ReadFile(a.stateFile)
 	if err != nil {
@@ -450,8 +513,9 @@ func (a *App) save() error {
 	stateFile := a.stateFile
 	a.mu.RUnlock()
 	if stateFile == "" {
-		stateFile = "cpa-auth-pool-state.json"
+		stateFile = defaultStateFile()
 	}
+	stateFile = resolveStateFile(stateFile)
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
