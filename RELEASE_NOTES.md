@@ -16,7 +16,10 @@ This release hardens trusted CPA-Helper proxy requests and serializes plugin sta
 ## Compatibility
 
 - Use with CPA-Helper-s `v0.3.26` or newer.
-- Use a CLIProxyAPI build containing the auth-pool priority-filter ordering fix.
+
+## Known limitation
+
+- CLIProxyAPI still reduces candidates to the globally highest priority tier before calling scheduler plugins. The plugin cannot select lower-priority pool members that the host does not provide.
 
 ## Validation
 
