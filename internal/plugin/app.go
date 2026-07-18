@@ -219,6 +219,12 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 			allowedTypes[normalized] = struct{}{}
 		}
 	}
+	allowedProviders := make(map[string]struct{}, len(pool.Providers))
+	for _, provider := range pool.Providers {
+		if provider = normalizeProviderKey(provider); provider != "" {
+			allowedProviders[provider] = struct{}{}
+		}
+	}
 	poolMatched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	eligible := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	ruleExcluded := 0
@@ -239,7 +245,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	for _, candidate := range req.Candidates {
 		matchedPool := false
-		if _, ok := allowed[normalizeAuthIDKey(candidate.ID)]; ok {
+		if _, ok := allowedProviders[normalizeProviderKey(candidate.Provider)]; ok {
+			matchedPool = true
+		} else if _, ok := allowed[normalizeAuthIDKey(candidate.ID)]; ok {
 			if explicitCandidateConflictsWithPool(candidate, pool) {
 				ruleExcluded++
 				continue
@@ -285,7 +293,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		} else if ruleExcluded > 0 {
 			reason = "plugin_rules_excluded"
 			message = "all matching auth candidates were excluded by pool rules"
-		} else if len(allowed) == 0 && len(allowedTypes) > 0 && len(authTypes) == 0 {
+		} else if len(allowed) == 0 && len(allowedProviders) == 0 && len(allowedTypes) > 0 && len(authTypes) == 0 {
 			reason = "account_metadata_not_synced"
 			message = "account type or pool membership metadata has not been synchronized"
 		}

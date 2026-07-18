@@ -173,6 +173,42 @@ func TestSchedulerRestrictsToBoundPool(t *testing.T) {
 	}
 }
 
+func TestSchedulerMatchesAllCredentialsForExplicitProviderChannel(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-provider-channel"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{
+		ID: "provider-pool", Name: "Provider Pool", Enabled: true,
+		AuthIDs:   []string{"cpa-provider:openai-compatible-mimo"},
+		Providers: []string{"openai-compatible-mimo"},
+		Models:    []string{"mimo-v2"},
+	}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "provider-pool"}}
+
+	req := SchedulerPickRequest{
+		Provider: "openai-compatible-mimo",
+		Model:    "mimo-v2",
+		Options:  SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "generated-auth-a", Provider: "openai-compatible-mimo", Priority: 100},
+			{ID: "generated-auth-b", Provider: "openai-compatible-mimo", Priority: 100},
+			{ID: "other-auth", Provider: "openai-compatible-other", Priority: 999},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	want := []string{"generated-auth-a", "generated-auth-b"}
+	for index, wantAuthID := range want {
+		raw, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeSchedulerResponse(t, raw)
+		if !resp.Handled || resp.AuthID != wantAuthID {
+			t.Fatalf("response %d = %+v, want %s", index+1, resp, wantAuthID)
+		}
+	}
+}
+
 func TestSchedulerRoundRobinsSamePriorityCandidates(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-round-robin"

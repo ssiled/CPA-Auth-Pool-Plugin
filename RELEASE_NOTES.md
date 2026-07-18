@@ -1,4 +1,15 @@
-# CPA Auth Pool 0.1.27
+# CPA Auth Pool 0.1.28
+
+This release adds provider-channel pools without requiring CLIProxyAPI changes.
+
+## Provider channels
+
+- Match scheduler candidates against the pool's explicit provider identifiers.
+- Include every credential currently configured under the selected OpenAI-compatible channel.
+- Keep provider channels dynamic as credentials are added or removed in CPA.
+- Preserve least-loaded selection and round-robin tie breaking across channel credentials.
+
+## Previous 0.1.27 changes
 
 This release hardens per-account Codex concurrency scheduling for concurrent multi-user traffic.
 
