@@ -1,6 +1,6 @@
-# CPA Auth Pool 0.1.25
+# CPA Auth Pool 0.1.26
 
-This release adds pool-scoped logical priorities for CPA-Helper-s dual-layer scheduling.
+This release republishes the pool-scoped logical priority update with a fresh version so plugin-store clients can discover and install it reliably.
 
 ## Scheduling
 
