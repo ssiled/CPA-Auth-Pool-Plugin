@@ -1,6 +1,16 @@
-# CPA Auth Pool 0.1.26
+# CPA Auth Pool 0.1.27
 
-This release republishes the pool-scoped logical priority update with a fresh version so plugin-store clients can discover and install it reliably.
+This release hardens per-account Codex concurrency scheduling for concurrent multi-user traffic.
+
+## Concurrency
+
+- Select and reserve an account atomically under one lock.
+- Prefer the least-loaded account within the current priority group.
+- Use round-robin order to break equal-load ties.
+- Keep limits scoped to each account, never to the aggregate tier count.
+- Report plugin version, concurrency scope, strategy, and per-account live slots through the status API.
+- Return `auth_pool_busy` only after every eligible account is at its own limit.
+- Ignore auxiliary-model usage records when releasing the primary request slot.
 
 ## Scheduling
 

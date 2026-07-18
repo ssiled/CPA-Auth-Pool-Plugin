@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPluginRegistrationUsesConfiguredPluginID(t *testing.T) {
@@ -488,6 +489,170 @@ func TestSchedulerEnforcesPerAccountCodexTierConcurrencyLimit(t *testing.T) {
 	resp = decodeSchedulerResponse(t, raw)
 	if !resp.Handled || resp.AuthID != "codex-plus-a.json" {
 		t.Fatalf("after release response = %+v, want codex-plus-a.json", resp)
+	}
+}
+
+func TestSchedulerDistributesConcurrentUsersAcrossFullPoolCapacity(t *testing.T) {
+	app := NewApp()
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 2, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AccountTypes: []string{"plus"}, Models: []string{"gpt-test"}}}
+	app.state.KeyBindings = map[string]KeyBinding{}
+
+	const accountCount = 4
+	const perAccountLimit = 2
+	const requestCount = accountCount * perAccountLimit
+	candidates := make([]SchedulerAuthCandidate, 0, accountCount)
+	for index := 0; index < accountCount; index++ {
+		candidates = append(candidates, SchedulerAuthCandidate{
+			ID:         fmt.Sprintf("codex-plus-%d.json", index),
+			Provider:   "codex",
+			Priority:   100,
+			Status:     "active",
+			Attributes: map[string]string{"plan_type": "plus"},
+		})
+	}
+
+	type schedulerResult struct {
+		raw []byte
+		err error
+	}
+	results := make(chan schedulerResult, requestCount)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for index := 0; index < requestCount; index++ {
+		apiKey := fmt.Sprintf("sk-concurrent-user-%d", index)
+		apiKeyHash := hashAPIKey(apiKey)
+		app.state.KeyBindings[apiKeyHash] = KeyBinding{APIKeyHash: apiKeyHash, PoolID: "pool-plus", UserID: index + 1}
+		rawRequest, errMarshal := json.Marshal(SchedulerPickRequest{
+			Model:      "gpt-test",
+			Provider:   "codex",
+			Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+			Candidates: candidates,
+		})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			raw, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+			results <- schedulerResult{raw: raw, err: err}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	selectedCounts := map[string]int{}
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent scheduler error: %v", result.err)
+		}
+		response := decodeSchedulerResponse(t, result.raw)
+		if !response.Handled || response.AuthID == "" {
+			t.Fatalf("concurrent scheduler response = %+v", response)
+		}
+		selectedCounts[response.AuthID]++
+	}
+	if len(selectedCounts) != accountCount {
+		t.Fatalf("selected accounts = %#v, want all %d accounts", selectedCounts, accountCount)
+	}
+	for _, candidate := range candidates {
+		if selectedCounts[candidate.ID] != perAccountLimit {
+			t.Fatalf("selected count for %s = %d, want %d", candidate.ID, selectedCounts[candidate.ID], perAccountLimit)
+		}
+	}
+
+	extraKey := "sk-concurrent-extra"
+	extraHash := hashAPIKey(extraKey)
+	app.state.KeyBindings[extraHash] = KeyBinding{APIKeyHash: extraHash, PoolID: "pool-plus"}
+	extraRequest, _ := json.Marshal(SchedulerPickRequest{
+		Model:      "gpt-test",
+		Provider:   "codex",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + extraKey}}},
+		Candidates: candidates,
+	})
+	raw, err := app.HandleMethod(MethodSchedulerPick, extraRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginErr := decodeEnvelopeError(t, raw)
+	if pluginErr.Code != "auth_pool_busy" || pluginErr.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("full pool error = %+v, want auth_pool_busy 429", pluginErr)
+	}
+
+	for authID, count := range selectedCounts {
+		for index := 0; index < count; index++ {
+			usageRaw, _ := json.Marshal(UsageRecord{AuthID: authID})
+			if _, err := app.HandleMethod(MethodUsageHandle, usageRaw); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if slots := app.snapshot().ConcurrencySlots; len(slots) != 0 {
+		t.Fatalf("concurrency slots after release = %#v, want empty", slots)
+	}
+}
+
+func TestSchedulerPrefersLeastLoadedAccountBeforeRoundRobinTieBreak(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-least-loaded"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 3, "default": 1}
+	app.state.Pools = []PoolConfig{{ID: "pool-plus", Name: "Plus", Enabled: true, AccountTypes: []string{"plus"}, Models: []string{"gpt-test"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-plus"}}
+	app.state.ConcurrencySlots = map[string]ConcurrencySlot{
+		"codex-plus-a.json": {
+			AuthID:    "codex-plus-a.json",
+			Tier:      "plus",
+			Count:     2,
+			StartedAt: time.Now(),
+			ExpiresAt: time.Now().Add(time.Minute),
+		},
+	}
+
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:    "gpt-test",
+		Provider: "codex",
+		Options:  SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus-a.json", Provider: "codex", Priority: 100, Status: "active", Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-plus-b.json", Provider: "codex", Priority: 100, Status: "active", Attributes: map[string]string{"plan_type": "plus"}},
+		},
+	})
+	raw, err := app.HandleMethod(MethodSchedulerPick, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeSchedulerResponse(t, raw)
+	if response.AuthID != "codex-plus-b.json" {
+		t.Fatalf("selected auth = %q, want least-loaded codex-plus-b.json", response.AuthID)
+	}
+}
+
+func TestAdditionalUsageDoesNotReleasePrimaryConcurrencySlot(t *testing.T) {
+	app := NewApp()
+	started := time.Now()
+	app.state.ConcurrencySlots = map[string]ConcurrencySlot{
+		"codex-plus-a.json": {
+			AuthID: "codex-plus-a.json", Tier: "plus", Count: 1,
+			StartedAt: started, ExpiresAt: started.Add(time.Minute),
+		},
+	}
+	raw, _ := json.Marshal(UsageRecord{AuthID: "codex-plus-a.json", Additional: true})
+	if _, err := app.HandleMethod(MethodUsageHandle, raw); err != nil {
+		t.Fatal(err)
+	}
+	if slot := app.state.ConcurrencySlots["codex-plus-a.json"]; slot.Count != 1 {
+		t.Fatalf("additional usage released primary slot: %#v", slot)
+	}
+	raw, _ = json.Marshal(UsageRecord{AuthID: "codex-plus-a.json"})
+	if _, err := app.HandleMethod(MethodUsageHandle, raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(app.state.ConcurrencySlots) != 0 {
+		t.Fatalf("primary usage did not release slot: %#v", app.state.ConcurrencySlots)
 	}
 }
 

@@ -71,6 +71,9 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 }
 
 type statusSnapshot struct {
+	PluginVersion          string                    `json:"plugin_version"`
+	ConcurrencyScope       string                    `json:"concurrency_scope"`
+	ConcurrencyStrategy    string                    `json:"concurrency_strategy"`
 	SchedulerPriorities    bool                      `json:"scheduler_priorities"`
 	Pools                  []PoolConfig              `json:"pools"`
 	Bindings               []KeyBinding              `json:"bindings"`
@@ -116,6 +119,9 @@ func (a *App) snapshot() statusSnapshot {
 	limits := cloneConcurrencyLimits(a.state.CodexConcurrencyLimits)
 	counts := a.codexConcurrencyCountsLocked(now)
 	return statusSnapshot{
+		PluginVersion:          Version,
+		ConcurrencyScope:       "per_account",
+		ConcurrencyStrategy:    "least_loaded_round_robin",
 		SchedulerPriorities:    true,
 		Pools:                  append([]PoolConfig(nil), a.state.Pools...),
 		Bindings:               bindings,
@@ -368,6 +374,7 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	pool.AuthIDs = cleanStringList(pool.AuthIDs)
 	pool.ResolvedAuthIDs = cleanStringList(pool.ResolvedAuthIDs)
 	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
+	pool.Providers = cleanLowerStringList(pool.Providers)
 	pool.Models = cleanModelList(pool.Models)
 	if pool.ID == "" || pool.Name == "" {
 		return jsonError(http.StatusBadRequest, "invalid_pool", "id and name are required")

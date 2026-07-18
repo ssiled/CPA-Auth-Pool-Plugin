@@ -56,6 +56,7 @@ type PoolConfig struct {
 	AuthIDs         []string `json:"auth_ids"`
 	ResolvedAuthIDs []string `json:"resolved_auth_ids,omitempty"`
 	AccountTypes    []string `json:"account_types,omitempty"`
+	Providers       []string `json:"providers,omitempty"`
 	Models          []string `json:"models,omitempty"`
 	Enabled         bool     `json:"enabled"`
 }
@@ -310,14 +311,10 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		group := eligible[groupStart:groupEnd]
 		offset := a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, eligible[groupStart].Priority), len(group))
-		for index := 0; index < len(group); index++ {
-			selected := group[(offset+index)%len(group)]
-			if tier := candidateTiers[selected.ID]; tier != "" {
-				if !a.reserveConcurrencySlotIfAvailable(selected, tier, now) {
-					blockedByConcurrency = true
-					continue
-				}
-			}
+		pick := a.selectAndReserveConcurrencyCandidate(group, candidateTiers, offset, now)
+		blockedByConcurrency = blockedByConcurrency || pick.Blocked
+		if pick.Selected {
+			selected := pick.Candidate
 			a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, &selected, "selected", "", http.StatusOK, now)
 			return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 		}
@@ -888,6 +885,7 @@ func cloneState(state State) State {
 		pool.AuthIDs = append([]string(nil), pool.AuthIDs...)
 		pool.ResolvedAuthIDs = append([]string(nil), pool.ResolvedAuthIDs...)
 		pool.AccountTypes = append([]string(nil), pool.AccountTypes...)
+		pool.Providers = append([]string(nil), pool.Providers...)
 		pool.Models = append([]string(nil), pool.Models...)
 		cloned.Pools[index] = pool
 	}

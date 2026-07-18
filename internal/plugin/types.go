@@ -11,7 +11,7 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.26"
+	Version       = "0.1.27"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
@@ -138,6 +138,7 @@ type UsageRecord struct {
 	Provider        string       `json:"Provider,omitempty"`
 	AuthID          string       `json:"AuthID,omitempty"`
 	AuthType        string       `json:"AuthType,omitempty"`
+	Additional      bool         `json:"Additional,omitempty"`
 	Failed          bool         `json:"Failed,omitempty"`
 	Failure         UsageFailure `json:"Failure,omitempty"`
 	ResponseHeaders http.Header  `json:"ResponseHeaders,omitempty"`

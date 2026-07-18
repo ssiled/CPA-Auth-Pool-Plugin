@@ -90,6 +90,9 @@ func providerPreferencesForPool(pool PoolConfig) []string {
 		seen[provider] = true
 		providers = append(providers, provider)
 	}
+	for _, provider := range pool.Providers {
+		add(provider)
+	}
 	for _, value := range pool.AccountTypes {
 		for _, accountType := range accountTypeAliases(value) {
 			switch accountType {

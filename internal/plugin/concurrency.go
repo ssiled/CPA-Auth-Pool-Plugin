@@ -16,6 +16,12 @@ type ConcurrencySlot struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+type concurrencyPickResult struct {
+	Candidate SchedulerAuthCandidate
+	Selected  bool
+	Blocked   bool
+}
+
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if len(raw) == 0 {
 		return OKEnvelope(map[string]any{})
@@ -25,7 +31,7 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 		return OKEnvelope(map[string]any{})
 	}
 	a.recordUsageEvent(record)
-	if authID := strings.TrimSpace(record.AuthID); authID != "" {
+	if authID := strings.TrimSpace(record.AuthID); authID != "" && !record.Additional {
 		a.releaseConcurrencySlot(authID)
 	}
 	return OKEnvelope(map[string]any{})
@@ -57,30 +63,70 @@ func (a *App) releaseConcurrencySlot(authID string) {
 	a.mu.Unlock()
 }
 
-func (a *App) reserveConcurrencySlotIfAvailable(candidate SchedulerAuthCandidate, tier string, now time.Time) bool {
-	tier = normalizeConcurrencyTier(tier)
-	if tier == "" {
-		return true
+// selectAndReserveConcurrencyCandidate chooses the least-loaded candidate and
+// reserves its slot while holding one lock. The offset only breaks load ties,
+// preserving round-robin fairness without opening a race between selection and
+// reservation under concurrent requests.
+func (a *App) selectAndReserveConcurrencyCandidate(candidates []SchedulerAuthCandidate, tiers map[string]string, offset int, now time.Time) concurrencyPickResult {
+	if len(candidates) == 0 {
+		return concurrencyPickResult{}
 	}
+	if offset < 0 {
+		offset = 0
+	}
+	offset %= len(candidates)
+
 	a.mu.Lock()
-	limit := a.codexConcurrencyLimitLocked(tier)
-	if limit > 0 {
+	defer a.mu.Unlock()
+	if a.state.ConcurrencySlots == nil {
+		a.state.ConcurrencySlots = map[string]ConcurrencySlot{}
+	}
+
+	selectedIndex := -1
+	selectedCount := 0
+	blocked := false
+	for step := 0; step < len(candidates); step++ {
+		index := (offset + step) % len(candidates)
+		candidate := candidates[index]
+		tier := normalizeConcurrencyTier(tiers[candidate.ID])
+		if tier == "" {
+			// Non-Codex candidates do not consume Codex concurrency slots. Keep
+			// their effective load at zero and use the cursor for fair ties.
+			if selectedIndex < 0 || selectedCount > 0 {
+				selectedIndex = index
+				selectedCount = 0
+			}
+			continue
+		}
+
 		slot := a.state.ConcurrencySlots[candidate.ID]
 		if slot.ExpiresAt.IsZero() || !now.Before(slot.ExpiresAt) {
+			delete(a.state.ConcurrencySlots, candidate.ID)
 			slot = ConcurrencySlot{}
 		}
 		count := slot.Count
 		if count <= 0 && !slot.ExpiresAt.IsZero() {
 			count = 1
 		}
-		if count >= limit {
-			a.mu.Unlock()
-			return false
+		limit := a.codexConcurrencyLimitLocked(tier)
+		if limit > 0 && count >= limit {
+			blocked = true
+			continue
+		}
+		if selectedIndex < 0 || count < selectedCount {
+			selectedIndex = index
+			selectedCount = count
 		}
 	}
-	a.reserveConcurrencySlotLocked(candidate, tier, now)
-	a.mu.Unlock()
-	return true
+	if selectedIndex < 0 {
+		return concurrencyPickResult{Blocked: blocked}
+	}
+
+	selected := candidates[selectedIndex]
+	if tier := normalizeConcurrencyTier(tiers[selected.ID]); tier != "" {
+		a.reserveConcurrencySlotLocked(selected, tier, now)
+	}
+	return concurrencyPickResult{Candidate: selected, Selected: true, Blocked: blocked}
 }
 
 func (a *App) reserveConcurrencySlotLocked(candidate SchedulerAuthCandidate, tier string, now time.Time) {
