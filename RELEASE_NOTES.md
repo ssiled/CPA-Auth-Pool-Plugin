@@ -1,28 +1,31 @@
-# CPA Auth Pool 0.1.24
+# CPA Auth Pool 0.1.25
 
-This release hardens trusted CPA-Helper proxy requests and serializes plugin state persistence.
+This release adds pool-scoped logical priorities for CPA-Helper-s dual-layer scheduling.
 
-## Security
+## Scheduling
 
-- A request carrying a trusted `X-CPA-Helper-API-Key-Hash` header now fails closed when the hash has no plugin binding.
-- Inconsistent Helper/Plugin state can no longer fall back to unrelated global CPA accounts.
-- Direct CPA API keys without a Helper proxy header keep the existing unbound-key scheduling behavior.
+- Filter candidates by bound auth pool before applying logical priority.
+- Resolve priority as account override, then account type rule, then host fallback.
+- Preserve stable round-robin scheduling for accounts with the same logical priority.
+- Exclude negative host-priority and unavailable candidates.
 
-## State safety
+## Management
 
-- Serialize state saves so concurrent management mutations cannot publish snapshots out of order.
-- Retain the existing deep-copy, temporary-file, fsync and atomic-rename persistence path.
+- Add the authenticated `/auth-priorities` management route.
+- Persist account types, type priorities and per-account overrides.
+- Support full replacement and removal of stale account overrides.
+- Validate logical priorities in the `0..100` range.
 
-## Compatibility
+## Compatibility and diagnostics
 
-- Use with CPA-Helper-s `v0.3.26` or newer.
-
-## Known limitation
-
-- CLIProxyAPI still reduces candidates to the globally highest priority tier before calling scheduler plugins. The plugin cannot select lower-priority pool members that the host does not provide.
+- Normalize auth file names, email-derived identifiers and `root_cli_proxy_api_*` identifiers.
+- Report input, pool-matched and eligible candidate counts without logging credentials.
+- Keep host priority as an availability signal when used with a compatible CPA-Helper-s build.
 
 ## Validation
 
 - `go test ./...`
+- `go vet ./...`
+- GitHub Actions Linux amd64 CGO plugin build
 
 Add `https://raw.githubusercontent.com/ssiled/CPA-Auth-Pool-Plugin/main/registry.json` to `plugins.store-sources` to install or update the plugin.
