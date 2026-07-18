@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -144,41 +145,65 @@ func (a *App) updateAuthPriorities(body []byte) ManagementResponse {
 	}
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(body, &raw)
+	if err := validateLogicalPriorities("type_priorities", payload.TypePriorities); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_priority", err.Error())
+	}
+	if err := validateLogicalPriorities("auth_priority_overrides", payload.AuthPriorityOverrides); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_priority", err.Error())
+	}
 	nextTypes := normalizeAuthTypes(payload.AuthTypes)
 	nextTypePriorities := normalizeTypePriorities(payload.TypePriorities)
 	nextOverrides := normalizeAuthPriorityOverrides(payload.AuthPriorityOverrides)
 
-	a.mu.Lock()
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	a.mu.RLock()
+	nextState := cloneState(a.state)
+	stateFile := a.stateFile
+	a.mu.RUnlock()
 	if _, provided := raw["auth_types"]; provided {
-		a.state.AuthTypes = nextTypes
+		nextState.AuthTypes = nextTypes
 	}
 	if _, provided := raw["type_priorities"]; provided {
-		a.state.TypePriorities = nextTypePriorities
+		nextState.TypePriorities = nextTypePriorities
 	}
 	if payload.ReplaceOverrides {
-		a.state.AuthPriorityOverrides = nextOverrides
+		nextState.AuthPriorityOverrides = nextOverrides
 	} else {
-		if a.state.AuthPriorityOverrides == nil {
-			a.state.AuthPriorityOverrides = map[string]int{}
+		if nextState.AuthPriorityOverrides == nil {
+			nextState.AuthPriorityOverrides = map[string]int{}
 		}
 		for authID, priority := range nextOverrides {
-			a.state.AuthPriorityOverrides[authID] = priority
+			nextState.AuthPriorityOverrides[authID] = priority
 		}
 	}
 	for _, authID := range payload.RemoveOverrides {
-		delete(a.state.AuthPriorityOverrides, strings.TrimSpace(authID))
+		delete(nextState.AuthPriorityOverrides, normalizeAuthIDKey(authID))
 	}
-	a.mu.Unlock()
-	if err := a.save(); err != nil {
+	if err := persistState(nextState, stateFile); err != nil {
 		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
 	}
+	a.mu.Lock()
+	a.state.AuthTypes = nextState.AuthTypes
+	a.state.TypePriorities = nextState.TypePriorities
+	a.state.AuthPriorityOverrides = nextState.AuthPriorityOverrides
+	a.mu.Unlock()
 	return jsonResponse(http.StatusOK, map[string]any{"status": a.snapshot()})
+}
+
+func validateLogicalPriorities(field string, values map[string]int) error {
+	for key, priority := range values {
+		if priority < minLogicalPriority || priority > maxLogicalPriority {
+			return fmt.Errorf("%s[%q] must be between %d and %d", field, strings.TrimSpace(key), minLogicalPriority, maxLogicalPriority)
+		}
+	}
+	return nil
 }
 
 func normalizeAuthTypes(values map[string]string) map[string]string {
 	normalized := make(map[string]string, len(values))
 	for authID, accountType := range values {
-		authID = strings.TrimSpace(authID)
+		authID = normalizeAuthIDKey(authID)
 		accountType = normalizeAccountType(accountType)
 		if authID != "" && accountType != "" {
 			normalized[authID] = accountType
@@ -201,7 +226,7 @@ func normalizeTypePriorities(values map[string]int) map[string]int {
 func normalizeAuthPriorityOverrides(values map[string]int) map[string]int {
 	normalized := make(map[string]int, len(values))
 	for authID, priority := range values {
-		authID = strings.TrimSpace(authID)
+		authID = normalizeAuthIDKey(authID)
 		if authID != "" {
 			normalized[authID] = priority
 		}

@@ -32,6 +32,11 @@ const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
 
 const legacyStateFile = "cpa-auth-pool-state.json"
 
+const (
+	minLogicalPriority = 0
+	maxLogicalPriority = 100
+)
+
 type State struct {
 	Pools                  []PoolConfig               `json:"pools"`
 	KeyBindings            map[string]KeyBinding      `json:"key_bindings"`
@@ -131,8 +136,11 @@ func (a *App) configure(raw []byte) error {
 			}
 		}
 	}
+	if err := validateStateFilePath(stateFile); err != nil {
+		return err
+	}
 	a.mu.Lock()
-	a.stateFile = stateFile
+	a.stateFile = resolveStateFile(stateFile)
 	a.mu.Unlock()
 	return a.load()
 }
@@ -200,7 +208,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	allowed := make(map[string]struct{}, len(pool.AuthIDs))
 	for _, id := range poolCandidateAuthIDs(pool) {
-		if id = strings.TrimSpace(id); id != "" {
+		if id = normalizeAuthIDKey(id); id != "" {
 			allowed[id] = struct{}{}
 		}
 	}
@@ -210,7 +218,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 			allowedTypes[normalized] = struct{}{}
 		}
 	}
-	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
+	poolMatched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
+	eligible := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
+	ruleExcluded := 0
 	candidateTiers := map[string]string{}
 	fallbackTier := poolFallbackConcurrencyTier(pool)
 	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
@@ -227,50 +237,79 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return candidate
 	}
 	for _, candidate := range req.Candidates {
-		if !schedulerCandidateStatusEligible(candidate.Status) {
-			continue
-		}
-		if _, ok := allowed[candidate.ID]; ok {
+		matchedPool := false
+		if _, ok := allowed[normalizeAuthIDKey(candidate.ID)]; ok {
 			if explicitCandidateConflictsWithPool(candidate, pool) {
+				ruleExcluded++
 				continue
 			}
-			if !reserveCandidate(candidate) {
+			matchedPool = true
+		} else {
+			candidateTypes := schedulerCandidateAccountTypes(candidate, authTypes)
+			_, knownAccountType := authIDStringValue(authTypes, normalizeAuthIDKey(candidate.ID))
+			if !knownAccountType && candidateConflictsWithPool(candidate, pool) {
+				for _, candidateType := range candidateTypes {
+					if _, ok := allowedTypes[candidateType]; ok {
+						ruleExcluded++
+						break
+					}
+				}
 				continue
 			}
-			matched = append(matched, applySchedulerPriority(candidate))
-			continue
-		}
-		if candidateConflictsWithPool(candidate, pool) {
-			continue
-		}
-		for _, candidateType := range candidateAccountTypes(candidate) {
-			if _, ok := allowedTypes[candidateType]; ok {
-				if !reserveCandidate(candidate) {
+			for _, candidateType := range candidateTypes {
+				if _, ok := allowedTypes[candidateType]; ok {
+					matchedPool = true
 					break
 				}
-				matched = append(matched, applySchedulerPriority(candidate))
-				break
 			}
 		}
+		if !matchedPool {
+			continue
+		}
+		poolMatched = append(poolMatched, candidate)
+		if candidate.Priority < 0 || !schedulerCandidateStatusEligible(candidate.Status) {
+			continue
+		}
+		if !reserveCandidate(candidate) {
+			continue
+		}
+		eligible = append(eligible, applySchedulerPriority(candidate))
 	}
-	if len(matched) == 0 {
-		a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "no_eligible_candidates", http.StatusServiceUnavailable, now)
+	if len(poolMatched) == 0 {
+		reason := "pool_no_matching_candidates"
+		message := "bound auth pool has no matching auth candidates"
+		if len(req.Candidates) == 0 {
+			reason = "no_input_candidates"
+			message = "host supplied no auth candidates"
+		} else if ruleExcluded > 0 {
+			reason = "plugin_rules_excluded"
+			message = "all matching auth candidates were excluded by pool rules"
+		} else if len(allowed) == 0 && len(allowedTypes) > 0 && len(authTypes) == 0 {
+			reason = "account_metadata_not_synced"
+			message = "account type or pool membership metadata has not been synchronized"
+		}
+		a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", reason, http.StatusServiceUnavailable, now)
+		return schedulerBlocked("auth_pool_unavailable", message, http.StatusServiceUnavailable)
+	}
+	if len(eligible) == 0 {
+		reason := schedulerIneligibleReason(poolMatched)
+		a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", reason, http.StatusServiceUnavailable, now)
 		return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no eligible auth candidates", http.StatusServiceUnavailable)
 	}
-	sort.Slice(matched, func(i, j int) bool {
-		if matched[i].Priority == matched[j].Priority {
-			return matched[i].ID < matched[j].ID
+	sort.Slice(eligible, func(i, j int) bool {
+		if eligible[i].Priority == eligible[j].Priority {
+			return eligible[i].ID < eligible[j].ID
 		}
-		return matched[i].Priority > matched[j].Priority
+		return eligible[i].Priority > eligible[j].Priority
 	})
 	blockedByConcurrency := false
-	for groupStart := 0; groupStart < len(matched); {
+	for groupStart := 0; groupStart < len(eligible); {
 		groupEnd := groupStart + 1
-		for groupEnd < len(matched) && matched[groupEnd].Priority == matched[groupStart].Priority {
+		for groupEnd < len(eligible) && eligible[groupEnd].Priority == eligible[groupStart].Priority {
 			groupEnd++
 		}
-		group := matched[groupStart:groupEnd]
-		offset := a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, matched[groupStart].Priority), len(group))
+		group := eligible[groupStart:groupEnd]
+		offset := a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, eligible[groupStart].Priority), len(group))
 		for index := 0; index < len(group); index++ {
 			selected := group[(offset+index)%len(group)]
 			if tier := candidateTiers[selected.ID]; tier != "" {
@@ -279,31 +318,26 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 					continue
 				}
 			}
-			a.recordSchedulerEvent(req, &binding, &pool, matched, &selected, "selected", "", http.StatusOK, now)
+			a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, &selected, "selected", "", http.StatusOK, now)
 			return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: selected.ID})
 		}
 		groupStart = groupEnd
 	}
 	if blockedByConcurrency {
-		a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "auth_pool_busy", http.StatusTooManyRequests, now)
+		a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", "auth_pool_busy", http.StatusTooManyRequests, now)
 		return schedulerBlocked("auth_pool_busy", "bound auth pool accounts are at concurrency limit", http.StatusTooManyRequests)
 	}
-	a.recordSchedulerEvent(req, &binding, &pool, matched, nil, "blocked", "no_available_candidates", http.StatusServiceUnavailable, now)
+	a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", "no_available_candidates", http.StatusServiceUnavailable, now)
 	return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no available auth candidates", http.StatusServiceUnavailable)
 }
 
 func schedulerPriorityForCandidate(candidate SchedulerAuthCandidate, authTypes map[string]string, typePriorities, overrides map[string]int) int {
-	// Negative host priorities are operational safety signals (quota exhausted,
-	// cooldown, or an explicit low-priority override). They must take precedence
-	// over logical pool/type priorities so an unhealthy account is not promoted.
-	if candidate.Priority < 0 {
-		return candidate.Priority
-	}
-	authID := strings.TrimSpace(candidate.ID)
-	if priority, ok := overrides[authID]; ok {
+	authID := normalizeAuthIDKey(candidate.ID)
+	if priority, ok := authIDIntValue(overrides, authID); ok {
 		return priority
 	}
-	if accountType := normalizeAccountType(authTypes[authID]); accountType != "" {
+	if accountTypeValue, ok := authIDStringValue(authTypes, authID); ok {
+		accountType := normalizeAccountType(accountTypeValue)
 		if priority, ok := typePriorities[accountType]; ok {
 			return priority
 		}
@@ -321,6 +355,44 @@ func schedulerPriorityForCandidate(candidate SchedulerAuthCandidate, authTypes m
 	return priority
 }
 
+func authIDStringValue(values map[string]string, authID string) (string, bool) {
+	if value, ok := values[authID]; ok {
+		return value, true
+	}
+	for key, value := range values {
+		if normalizeAuthIDKey(key) == authID {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func authIDIntValue(values map[string]int, authID string) (int, bool) {
+	if value, ok := values[authID]; ok {
+		return value, true
+	}
+	for key, value := range values {
+		if normalizeAuthIDKey(key) == authID {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func schedulerIneligibleReason(candidates []SchedulerAuthCandidate) string {
+	allNegative := len(candidates) > 0
+	for _, candidate := range candidates {
+		if candidate.Priority >= 0 {
+			allNegative = false
+			break
+		}
+	}
+	if allNegative {
+		return "all_candidates_quota_exhausted"
+	}
+	return "pool_candidates_unavailable"
+}
+
 func schedulerCandidateStatusEligible(status string) bool {
 	status = normalizeAccountType(status)
 	switch status {
@@ -329,6 +401,14 @@ func schedulerCandidateStatusEligible(status string) bool {
 	default:
 		return true
 	}
+}
+
+func schedulerCandidateAccountTypes(candidate SchedulerAuthCandidate, authTypes map[string]string) []string {
+	values := candidateAccountTypes(candidate)
+	if accountType, ok := authIDStringValue(authTypes, normalizeAuthIDKey(candidate.ID)); ok {
+		values = append(values, accountTypeAliases(accountType)...)
+	}
+	return cleanLowerStringList(values)
 }
 
 func poolCandidateAuthIDs(pool PoolConfig) []string {
@@ -564,6 +644,36 @@ func normalizeAccountType(value string) string {
 	return strings.Join(cleaned, "_")
 }
 
+func normalizeAuthIDKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "\\", "/")
+	if index := strings.LastIndex(value, "/"); index >= 0 {
+		value = value[index+1:]
+	}
+	var builder strings.Builder
+	lastUnderscore := false
+	for _, char := range value {
+		isLetter := char >= 'a' && char <= 'z'
+		isDigit := char >= '0' && char <= '9'
+		if isLetter || isDigit {
+			builder.WriteRune(char)
+			lastUnderscore = false
+			continue
+		}
+		if builder.Len() > 0 && !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	key := strings.Trim(builder.String(), "_")
+	for _, prefix := range []string{"root_cli_proxy_api_", "root_cli_proxy_", "cli_proxy_api_"} {
+		if strings.HasPrefix(key, prefix) {
+			return strings.TrimPrefix(key, prefix)
+		}
+	}
+	return key
+}
+
 func (a *App) poolLocked(id string) (PoolConfig, bool) {
 	for _, pool := range a.state.Pools {
 		if pool.ID == id {
@@ -582,7 +692,20 @@ func resolveStateFile(value string) string {
 	if value == "" || value == legacyStateFile {
 		return defaultStateFile()
 	}
-	return value
+	return filepath.Clean(value)
+}
+
+func validateStateFilePath(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return nil
+	}
+	for _, part := range strings.FieldsFunc(filepath.ToSlash(value), func(char rune) bool { return char == '/' }) {
+		if part == ".." {
+			return errors.New("state_file must not traverse parent directories")
+		}
+	}
+	return nil
 }
 
 func legacyStateCandidates(stateFile string) []string {
@@ -675,6 +798,15 @@ func (a *App) load() error {
 	if state.AuthPriorityOverrides == nil {
 		state.AuthPriorityOverrides = map[string]int{}
 	}
+	if err := validateLogicalPriorities("type_priorities", state.TypePriorities); err != nil {
+		return err
+	}
+	if err := validateLogicalPriorities("auth_priority_overrides", state.AuthPriorityOverrides); err != nil {
+		return err
+	}
+	state.AuthTypes = normalizeAuthTypes(state.AuthTypes)
+	state.TypePriorities = normalizeTypePriorities(state.TypePriorities)
+	state.AuthPriorityOverrides = normalizeAuthPriorityOverrides(state.AuthPriorityOverrides)
 	if state.ProxyKeyHashes == nil {
 		state.ProxyKeyHashes = []string{}
 	}
@@ -697,6 +829,13 @@ func (a *App) save() error {
 	state := cloneState(a.state)
 	stateFile := a.stateFile
 	a.mu.RUnlock()
+	if stateFile == "" {
+		stateFile = defaultStateFile()
+	}
+	return persistState(state, stateFile)
+}
+
+func persistState(state State, stateFile string) error {
 	if stateFile == "" {
 		stateFile = defaultStateFile()
 	}

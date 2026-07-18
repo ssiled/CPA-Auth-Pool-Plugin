@@ -38,10 +38,13 @@ type PluginEvent struct {
 	UserID           int                    `json:"user_id,omitempty"`
 	Username         string                 `json:"username,omitempty"`
 	SelectedAuthID   string                 `json:"selected_auth_id,omitempty"`
-	SelectedPriority int                    `json:"selected_priority,omitempty"`
+	SelectedPriority *int                   `json:"selected_priority,omitempty"`
 	SelectedState    string                 `json:"selected_state,omitempty"`
 	CandidateCount   int                    `json:"candidate_count"`
 	MatchedCount     int                    `json:"matched_count"`
+	InputCandidates  int                    `json:"input_candidates"`
+	PoolMatched      int                    `json:"pool_matched_candidates"`
+	Eligible         int                    `json:"eligible_candidates"`
 	MatchedAuthIDs   []string               `json:"matched_auth_ids,omitempty"`
 	AccountTypes     []string               `json:"account_types,omitempty"`
 	Candidates       []PluginEventCandidate `json:"candidates,omitempty"`
@@ -62,19 +65,26 @@ type pluginEventResponse struct {
 }
 
 func (a *App) recordSchedulerEvent(req SchedulerPickRequest, binding *KeyBinding, pool *PoolConfig, matched []SchedulerAuthCandidate, selected *SchedulerAuthCandidate, status, reason string, httpStatus int, startedAt time.Time) {
+	a.recordSchedulerEventDetails(req, binding, pool, matched, matched, selected, status, reason, httpStatus, startedAt)
+}
+
+func (a *App) recordSchedulerEventDetails(req SchedulerPickRequest, binding *KeyBinding, pool *PoolConfig, poolMatched, eligible []SchedulerAuthCandidate, selected *SchedulerAuthCandidate, status, reason string, httpStatus int, startedAt time.Time) {
 	event := PluginEvent{
-		Timestamp:      time.Now(),
-		Phase:          "selection",
-		Status:         status,
-		Reason:         truncatePluginEventReason(reason),
-		HTTPStatus:     httpStatus,
-		DurationMS:     time.Since(startedAt).Milliseconds(),
-		Provider:       strings.TrimSpace(req.Provider),
-		Model:          strings.TrimSpace(req.Model),
-		Stream:         req.Stream,
-		CandidateCount: len(req.Candidates),
-		MatchedCount:   len(matched),
-		MatchedAuthIDs: candidateIDs(matched, pluginEventCandidateLimit),
+		Timestamp:       time.Now(),
+		Phase:           "selection",
+		Status:          status,
+		Reason:          truncatePluginEventReason(reason),
+		HTTPStatus:      httpStatus,
+		DurationMS:      time.Since(startedAt).Milliseconds(),
+		Provider:        strings.TrimSpace(req.Provider),
+		Model:           strings.TrimSpace(req.Model),
+		Stream:          req.Stream,
+		CandidateCount:  len(req.Candidates),
+		MatchedCount:    len(poolMatched),
+		InputCandidates: len(req.Candidates),
+		PoolMatched:     len(poolMatched),
+		Eligible:        len(eligible),
+		MatchedAuthIDs:  candidateIDs(poolMatched, pluginEventCandidateLimit),
 	}
 	if binding != nil {
 		event.UserID = binding.UserID
@@ -87,7 +97,8 @@ func (a *App) recordSchedulerEvent(req SchedulerPickRequest, binding *KeyBinding
 	}
 	if selected != nil {
 		event.SelectedAuthID = strings.TrimSpace(selected.ID)
-		event.SelectedPriority = selected.Priority
+		priority := selected.Priority
+		event.SelectedPriority = &priority
 		event.SelectedState = strings.TrimSpace(selected.Status)
 		event.Candidates = schedulerCandidateEvents([]SchedulerAuthCandidate{*selected}, 1)
 	} else if status == "blocked" {

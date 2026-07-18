@@ -2,10 +2,13 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -987,13 +990,14 @@ func TestSchedulerAuthPriorityOverrideWinsTypePriority(t *testing.T) {
 func TestSchedulerNegativeHostPriorityWinsLogicalPriority(t *testing.T) {
 	candidate := SchedulerAuthCandidate{ID: "account.json", Priority: -1, Attributes: map[string]string{"plan_type": "plus"}}
 	priority := schedulerPriorityForCandidate(candidate, map[string]string{"account.json": "plus"}, map[string]int{"plus": 10}, map[string]int{"account.json": 50})
-	if priority != -1 {
-		t.Fatalf("scheduler priority = %d, want -1", priority)
+	if priority != 50 {
+		t.Fatalf("scheduler priority = %d, want override 50 before eligibility filtering", priority)
 	}
 }
 
 func TestUpdateAuthPrioritiesNormalizesAndRemovesOverrides(t *testing.T) {
 	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "state.json")
 	response := app.updateAuthPriorities([]byte(`{
 		"auth_types":{" account.json ":"Plus"},
 		"type_priorities":{"PLUS":12},
@@ -1002,14 +1006,224 @@ func TestUpdateAuthPrioritiesNormalizesAndRemovesOverrides(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.StatusCode, response.Body)
 	}
-	if app.state.AuthTypes["account.json"] != "plus" || app.state.TypePriorities["plus"] != 12 || app.state.AuthPriorityOverrides["account.json"] != 40 {
+	if app.state.AuthTypes["account_json"] != "plus" || app.state.TypePriorities["plus"] != 12 || app.state.AuthPriorityOverrides["account_json"] != 40 {
 		t.Fatalf("priority state = %#v", app.state)
 	}
 	response = app.updateAuthPriorities([]byte(`{"remove_overrides":["account.json"]}`))
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("remove status = %d, body = %s", response.StatusCode, response.Body)
 	}
-	if _, ok := app.state.AuthPriorityOverrides["account.json"]; ok {
+	if _, ok := app.state.AuthPriorityOverrides["account_json"]; ok {
 		t.Fatal("manual override was not removed")
+	}
+}
+
+func TestSchedulerFreePoolIgnoresHigherPriorityOutsideAccount(t *testing.T) {
+	app := NewApp()
+	apiKey := "priority-test-key-free"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "free", Name: "Free", AuthIDs: []string{"free-a.json", "free-b.json"}, Models: []string{"codex-auto-review"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "free"}}
+	app.state.AuthTypes = map[string]string{"free_a_json": "free", "free_b_json": "free", "k12_json": "k12"}
+	app.state.TypePriorities = map[string]int{"free": 5, "k12": 50}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:   "codex-auto-review",
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "k12.json", Provider: "codex", Priority: 0, Status: "active"},
+			{ID: "free-a.json", Provider: "codex", Priority: 0, Status: "active"},
+			{ID: "free-b.json", Provider: "codex", Priority: 0, Status: "active"},
+		},
+	})
+	first, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := decodeSchedulerResponse(t, first).AuthID
+	secondID := decodeSchedulerResponse(t, second).AuthID
+	if firstID != "free-a.json" || secondID != "free-b.json" {
+		t.Fatalf("selected %q then %q, want free pool round robin", firstID, secondID)
+	}
+}
+
+func TestSchedulerRejectsNegativeHostPriority(t *testing.T) {
+	app := NewApp()
+	apiKey := "priority-test-key-negative"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "free", Name: "Free", AuthIDs: []string{"quota.json"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "free"}}
+	app.state.AuthTypes = map[string]string{"quota_json": "free"}
+	app.state.TypePriorities = map[string]int{"free": 100}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:      "gpt",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "quota.json", Priority: -1, Status: "active"}},
+	})
+	raw, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelopeError := decodeEnvelopeError(t, raw)
+	if envelopeError.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("response error = %#v, want 503", envelopeError)
+	}
+	event := app.pluginEventSnapshot(1).Items[0]
+	if event.Reason != "all_candidates_quota_exhausted" || event.PoolMatched != 1 || event.Eligible != 0 {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestSchedulerNormalizesAuthIDVariants(t *testing.T) {
+	app := NewApp()
+	apiKey := "priority-test-key-normalized"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "free", Name: "Free", AuthIDs: []string{"burenbigbie4105@outlook.com.json"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "free"}}
+	app.state.AuthTypes = map[string]string{"burenbigbie4105_outlook_com_json": "free"}
+	app.state.TypePriorities = map[string]int{"free": 5}
+	app.state.AuthPriorityOverrides = map[string]int{"burenbigbie4105_outlook_com_json": 50}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:      "gpt",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "root_cli_proxy_api_burenbigbie4105_outlook_com_json", Priority: 0, Status: "active"}},
+	})
+	raw, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected := decodeSchedulerResponse(t, raw).AuthID; selected != "root_cli_proxy_api_burenbigbie4105_outlook_com_json" {
+		t.Fatalf("selected auth = %q", selected)
+	}
+	event := app.pluginEventSnapshot(1).Items[0]
+	if event.SelectedPriority == nil || *event.SelectedPriority != 50 {
+		t.Fatalf("selected priority = %v, want 50", event.SelectedPriority)
+	}
+}
+
+func TestSchedulerUsesSyncedAccountTypeForDynamicPoolMembership(t *testing.T) {
+	app := NewApp()
+	apiKey := "priority-test-key-synced-type"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "free", Name: "Free", AccountTypes: []string{"free"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "free"}}
+	app.state.AuthTypes = map[string]string{"account_json": "free"}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:      "gpt",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "account.json", Provider: "codex", Priority: 0, Status: "active"}},
+	})
+	raw, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected := decodeSchedulerResponse(t, raw).AuthID; selected != "account.json" {
+		t.Fatalf("selected auth = %q, want account.json", selected)
+	}
+}
+
+func TestUpdateAuthPrioritiesRejectsInvalidRange(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "state.json")
+	for _, body := range []string{
+		`{"type_priorities":{"free":-1}}`,
+		`{"auth_priority_overrides":{"account.json":101}}`,
+	} {
+		response := app.updateAuthPriorities([]byte(body))
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("body %s status = %d, want 400", body, response.StatusCode)
+		}
+	}
+}
+
+func TestUpdateAuthPrioritiesSaveFailureDoesNotChangeMemory(t *testing.T) {
+	app := NewApp()
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.stateFile = filepath.Join(blocker, "state.json")
+	response := app.updateAuthPriorities([]byte(`{"type_priorities":{"free":5}}`))
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.StatusCode)
+	}
+	if len(app.state.TypePriorities) != 0 {
+		t.Fatalf("memory changed after save failure: %#v", app.state.TypePriorities)
+	}
+}
+
+func TestAuthPrioritiesPersistAcrossRestart(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	app := NewApp()
+	app.stateFile = stateFile
+	response := app.updateAuthPriorities([]byte(`{
+		"auth_types":{"account.json":"plus"},
+		"type_priorities":{"plus":15},
+		"auth_priority_overrides":{"account.json":50},
+		"replace_overrides":true
+	}`))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", response.StatusCode, response.Body)
+	}
+	restarted := NewApp()
+	restarted.stateFile = stateFile
+	if err := restarted.load(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.state.AuthTypes["account_json"] != "plus" || restarted.state.TypePriorities["plus"] != 15 || restarted.state.AuthPriorityOverrides["account_json"] != 50 {
+		t.Fatalf("restarted state = %#v", restarted.state)
+	}
+}
+
+func TestSchedulerConcurrentPriorityUpdates(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "state.json")
+	apiKey := "priority-test-key-concurrent"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool", Name: "Pool", AuthIDs: []string{"a.json", "b.json"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "pool"}}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:   "gpt",
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "a.json", Priority: 0, Status: "active"},
+			{ID: "b.json", Priority: 0, Status: "active"},
+		},
+	})
+	var wait sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 40; iteration++ {
+				if _, err := app.pickScheduler(request); err != nil {
+					t.Errorf("pick scheduler: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for iteration := 0; iteration < 10; iteration++ {
+			body := fmt.Sprintf(`{"type_priorities":{"free":%d},"auth_types":{"a.json":"free","b.json":"free"}}`, iteration%6)
+			if response := app.updateAuthPriorities([]byte(body)); response.StatusCode != http.StatusOK {
+				t.Errorf("priority update status = %d body=%s", response.StatusCode, response.Body)
+				return
+			}
+		}
+	}()
+	wait.Wait()
+}
+
+func TestConfigureRejectsStateFileTraversal(t *testing.T) {
+	app := NewApp()
+	rawReq, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("state_file: ../outside.json\n")})
+	if _, err := app.HandleMethod(MethodPluginRegister, rawReq); err == nil || !strings.Contains(err.Error(), "must not traverse") {
+		t.Fatalf("configure error = %v, want traversal rejection", err)
 	}
 }

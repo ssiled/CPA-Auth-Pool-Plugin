@@ -36,8 +36,11 @@ func TestSchedulerEventsRecordSelectedAccount(t *testing.T) {
 	if event.Status != "selected" || event.SelectedAuthID != "auth-a" || event.PoolID != "002" || event.Username != "alice" {
 		t.Fatalf("event = %#v, want selected auth-a for pool 002", event)
 	}
-	if event.CandidateCount != 1 || event.MatchedCount != 1 || event.HTTPStatus != http.StatusOK {
+	if event.CandidateCount != 1 || event.MatchedCount != 1 || event.InputCandidates != 1 || event.PoolMatched != 1 || event.Eligible != 1 || event.HTTPStatus != http.StatusOK {
 		t.Fatalf("event counts/status = %#v", event)
+	}
+	if event.SelectedPriority == nil || *event.SelectedPriority != 22 {
+		t.Fatalf("selected priority = %v, want 22", event.SelectedPriority)
 	}
 }
 
@@ -60,8 +63,11 @@ func TestSchedulerEventsRecordNoEligibleCandidates(t *testing.T) {
 	}
 
 	event := app.pluginEventSnapshot(1).Items[0]
-	if event.Status != "blocked" || event.Reason != "no_eligible_candidates" || event.HTTPStatus != http.StatusServiceUnavailable {
-		t.Fatalf("event = %#v, want no eligible candidates", event)
+	if event.Status != "blocked" || event.Reason != "pool_no_matching_candidates" || event.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("event = %#v, want no pool matching candidates", event)
+	}
+	if event.InputCandidates != 1 || event.PoolMatched != 0 || event.Eligible != 0 {
+		t.Fatalf("diagnostic counts = %#v", event)
 	}
 	if len(event.Candidates) != 1 || event.Candidates[0].ID != "auth-a" {
 		t.Fatalf("candidate sample = %#v, want auth-a", event.Candidates)
