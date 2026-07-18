@@ -916,3 +916,100 @@ func TestCloneStateDetachesNestedCollections(t *testing.T) {
 		t.Fatalf("clone changed with source: %#v", cloned)
 	}
 }
+
+func TestSafePluginCallRecoversPanic(t *testing.T) {
+	response, err := safePluginCall(func() ([]byte, error) {
+		panic("boom")
+	})
+	if err == nil || response != nil {
+		t.Fatalf("safePluginCall response=%q error=%v", response, err)
+	}
+}
+
+func TestSchedulerSkipsDisabledCandidate(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-status-filter"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "pool", Name: "Pool", AuthIDs: []string{"disabled", "ready"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "pool"}}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:   "gpt",
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "disabled", Priority: 10, Status: "disabled"},
+			{ID: "ready", Priority: 1, Status: "ready"},
+		},
+	})
+	raw, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeSchedulerResponse(t, raw)
+	if response.AuthID != "ready" {
+		t.Fatalf("selected auth = %q, want ready", response.AuthID)
+	}
+}
+
+func TestSchedulerUsesPluginPriorityAfterPoolFiltering(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-plugin-priority"
+	hash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{ID: "paid", Name: "Paid", AuthIDs: []string{"k12.json", "plus.json"}, Models: []string{"gpt"}, Enabled: true}}
+	app.state.KeyBindings = map[string]KeyBinding{hash: {APIKeyHash: hash, PoolID: "paid"}}
+	app.state.AuthTypes = map[string]string{"k12.json": "k12", "plus.json": "plus"}
+	app.state.TypePriorities = map[string]int{"k12": 5, "plus": 20}
+	request, _ := json.Marshal(SchedulerPickRequest{
+		Model:   "gpt",
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "k12.json", Provider: "codex", Priority: 100, Status: "active"},
+			{ID: "plus.json", Provider: "codex", Priority: 0, Status: "active"},
+		},
+	})
+	raw, err := app.pickScheduler(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeSchedulerResponse(t, raw)
+	if response.AuthID != "plus.json" {
+		t.Fatalf("selected auth = %q, want plus.json", response.AuthID)
+	}
+}
+
+func TestSchedulerAuthPriorityOverrideWinsTypePriority(t *testing.T) {
+	candidate := SchedulerAuthCandidate{ID: "account.json", Priority: 1, Attributes: map[string]string{"plan_type": "plus"}}
+	priority := schedulerPriorityForCandidate(candidate, map[string]string{"account.json": "plus"}, map[string]int{"plus": 10}, map[string]int{"account.json": 50})
+	if priority != 50 {
+		t.Fatalf("scheduler priority = %d, want 50", priority)
+	}
+}
+
+func TestSchedulerNegativeHostPriorityWinsLogicalPriority(t *testing.T) {
+	candidate := SchedulerAuthCandidate{ID: "account.json", Priority: -1, Attributes: map[string]string{"plan_type": "plus"}}
+	priority := schedulerPriorityForCandidate(candidate, map[string]string{"account.json": "plus"}, map[string]int{"plus": 10}, map[string]int{"account.json": 50})
+	if priority != -1 {
+		t.Fatalf("scheduler priority = %d, want -1", priority)
+	}
+}
+
+func TestUpdateAuthPrioritiesNormalizesAndRemovesOverrides(t *testing.T) {
+	app := NewApp()
+	response := app.updateAuthPriorities([]byte(`{
+		"auth_types":{" account.json ":"Plus"},
+		"type_priorities":{"PLUS":12},
+		"auth_priority_overrides":{" account.json ":40}
+	}`))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, response.Body)
+	}
+	if app.state.AuthTypes["account.json"] != "plus" || app.state.TypePriorities["plus"] != 12 || app.state.AuthPriorityOverrides["account.json"] != 40 {
+		t.Fatalf("priority state = %#v", app.state)
+	}
+	response = app.updateAuthPriorities([]byte(`{"remove_overrides":["account.json"]}`))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("remove status = %d, body = %s", response.StatusCode, response.Body)
+	}
+	if _, ok := app.state.AuthPriorityOverrides["account.json"]; ok {
+		t.Fatal("manual override was not removed")
+	}
+}

@@ -16,6 +16,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 		{Method: http.MethodPost, Path: base + "/pools", Description: "Create or update an auth pool."},
 		{Method: http.MethodDelete, Path: base + "/pools", Description: "Delete an auth pool."},
 		{Method: http.MethodPost, Path: base + "/auth-models", Description: "Sync per-auth model catalogs used to filter /v1/models."},
+		{Method: http.MethodPost, Path: base + "/auth-priorities", Description: "Sync account types and scheduler-only priorities."},
 		{Method: http.MethodPost, Path: base + "/proxy-keys", Description: "Register trusted CPA API keys used by CPA-Helper forwarding."},
 		{Method: http.MethodGet, Path: base + "/bindings", Description: "List API key to pool bindings."},
 		{Method: http.MethodPost, Path: base + "/bindings", Description: "Bind an API key hash to an auth pool."},
@@ -45,6 +46,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.deletePool(idFromRequest(req)))
 	case req.Method == http.MethodPost && path == base+"/auth-models":
 		return OKEnvelope(a.syncAuthModels(req.Body))
+	case req.Method == http.MethodPost && path == base+"/auth-priorities":
+		return OKEnvelope(a.updateAuthPriorities(req.Body))
 	case req.Method == http.MethodPost && path == base+"/proxy-keys":
 		return OKEnvelope(a.upsertProxyKeys(req.Body))
 	case req.Method == http.MethodGet && path == base+"/bindings":
@@ -67,9 +70,13 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 }
 
 type statusSnapshot struct {
+	SchedulerPriorities    bool                      `json:"scheduler_priorities"`
 	Pools                  []PoolConfig              `json:"pools"`
 	Bindings               []KeyBinding              `json:"bindings"`
 	AuthModels             map[string][]string       `json:"auth_models,omitempty"`
+	AuthTypes              map[string]string         `json:"auth_types,omitempty"`
+	TypePriorities         map[string]int            `json:"type_priorities,omitempty"`
+	AuthPriorityOverrides  map[string]int            `json:"auth_priority_overrides,omitempty"`
 	ProxyKeyCount          int                       `json:"proxy_key_count"`
 	CodexConcurrencyLimits map[string]int            `json:"codex_concurrency_limits"`
 	Concurrency            concurrencySnapshot       `json:"concurrency"`
@@ -108,14 +115,98 @@ func (a *App) snapshot() statusSnapshot {
 	limits := cloneConcurrencyLimits(a.state.CodexConcurrencyLimits)
 	counts := a.codexConcurrencyCountsLocked(now)
 	return statusSnapshot{
+		SchedulerPriorities:    true,
 		Pools:                  append([]PoolConfig(nil), a.state.Pools...),
 		Bindings:               bindings,
 		AuthModels:             authModels,
+		AuthTypes:              cloneStringMap(a.state.AuthTypes),
+		TypePriorities:         cloneIntMap(a.state.TypePriorities),
+		AuthPriorityOverrides:  cloneIntMap(a.state.AuthPriorityOverrides),
 		ProxyKeyCount:          len(a.state.ProxyKeyHashes),
 		CodexConcurrencyLimits: limits,
 		Concurrency:            concurrencySnapshot{Counts: counts, Limits: limits},
 		ConcurrencySlots:       concurrencySlotSnapshots(now, a.state.ConcurrencySlots),
 	}
+}
+
+type authPrioritiesPayload struct {
+	AuthTypes             map[string]string `json:"auth_types"`
+	TypePriorities        map[string]int    `json:"type_priorities"`
+	AuthPriorityOverrides map[string]int    `json:"auth_priority_overrides"`
+	RemoveOverrides       []string          `json:"remove_overrides"`
+	ReplaceOverrides      bool              `json:"replace_overrides"`
+}
+
+func (a *App) updateAuthPriorities(body []byte) ManagementResponse {
+	var payload authPrioritiesPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(body, &raw)
+	nextTypes := normalizeAuthTypes(payload.AuthTypes)
+	nextTypePriorities := normalizeTypePriorities(payload.TypePriorities)
+	nextOverrides := normalizeAuthPriorityOverrides(payload.AuthPriorityOverrides)
+
+	a.mu.Lock()
+	if _, provided := raw["auth_types"]; provided {
+		a.state.AuthTypes = nextTypes
+	}
+	if _, provided := raw["type_priorities"]; provided {
+		a.state.TypePriorities = nextTypePriorities
+	}
+	if payload.ReplaceOverrides {
+		a.state.AuthPriorityOverrides = nextOverrides
+	} else {
+		if a.state.AuthPriorityOverrides == nil {
+			a.state.AuthPriorityOverrides = map[string]int{}
+		}
+		for authID, priority := range nextOverrides {
+			a.state.AuthPriorityOverrides[authID] = priority
+		}
+	}
+	for _, authID := range payload.RemoveOverrides {
+		delete(a.state.AuthPriorityOverrides, strings.TrimSpace(authID))
+	}
+	a.mu.Unlock()
+	if err := a.save(); err != nil {
+		return jsonError(http.StatusInternalServerError, "save_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"status": a.snapshot()})
+}
+
+func normalizeAuthTypes(values map[string]string) map[string]string {
+	normalized := make(map[string]string, len(values))
+	for authID, accountType := range values {
+		authID = strings.TrimSpace(authID)
+		accountType = normalizeAccountType(accountType)
+		if authID != "" && accountType != "" {
+			normalized[authID] = accountType
+		}
+	}
+	return normalized
+}
+
+func normalizeTypePriorities(values map[string]int) map[string]int {
+	normalized := make(map[string]int, len(values))
+	for accountType, priority := range values {
+		accountType = normalizeAccountType(accountType)
+		if accountType != "" {
+			normalized[accountType] = priority
+		}
+	}
+	return normalized
+}
+
+func normalizeAuthPriorityOverrides(values map[string]int) map[string]int {
+	normalized := make(map[string]int, len(values))
+	for authID, priority := range values {
+		authID = strings.TrimSpace(authID)
+		if authID != "" {
+			normalized[authID] = priority
+		}
+	}
+	return normalized
 }
 
 func cloneConcurrencyLimits(limits map[string]int) map[string]int {

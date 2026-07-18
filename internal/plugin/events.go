@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"encoding/json"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -8,10 +10,16 @@ import (
 )
 
 const (
-	pluginEventCapacity       = 500
-	pluginEventDefaultLimit   = 100
-	pluginEventCandidateLimit = 25
-	pluginEventReasonLimit    = 320
+	pluginEventCapacity        = 500
+	pluginEventDefaultLimit    = 100
+	pluginEventCandidateLimit  = 25
+	pluginEventReasonLimit     = 320
+	pluginEventReasonScanLimit = 4096
+)
+
+var (
+	pluginEventBearerPattern = regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._~+/=-]+`)
+	pluginEventSecretPattern = regexp.MustCompile(`(?i)((?:api[_-]?key|token|secret|password|cookie|authorization)\s*[:=]\s*)[^\s,;]+`)
 )
 
 type PluginEvent struct {
@@ -222,8 +230,53 @@ func candidateIDs(candidates []SchedulerAuthCandidate, limit int) []string {
 
 func truncatePluginEventReason(value string) string {
 	value = strings.TrimSpace(value)
+	if len(value) > pluginEventReasonScanLimit {
+		value = value[:pluginEventReasonScanLimit]
+	}
+	var payload any
+	if json.Unmarshal([]byte(value), &payload) == nil {
+		if sanitized, err := json.Marshal(redactPluginEventValue(payload)); err == nil {
+			value = string(sanitized)
+		}
+	}
+	value = pluginEventBearerPattern.ReplaceAllString(value, `${1}[REDACTED]`)
+	value = pluginEventSecretPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	if len(value) <= pluginEventReasonLimit {
 		return value
 	}
 	return value[:pluginEventReasonLimit]
+}
+
+func redactPluginEventValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if pluginEventSensitiveField(key) {
+				result[key] = "[REDACTED]"
+				continue
+			}
+			result[key] = redactPluginEventValue(child)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, child := range typed {
+			result[index] = redactPluginEventValue(child)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func pluginEventSensitiveField(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(key)
+	for _, fragment := range []string{"api_key", "apikey", "token", "secret", "password", "cookie", "authorization", "credential"} {
+		if strings.Contains(key, fragment) {
+			return true
+		}
+	}
+	return false
 }

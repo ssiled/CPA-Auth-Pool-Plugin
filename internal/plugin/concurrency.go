@@ -57,16 +57,6 @@ func (a *App) releaseConcurrencySlot(authID string) {
 	a.mu.Unlock()
 }
 
-func (a *App) reserveConcurrencySlot(candidate SchedulerAuthCandidate, tier string, now time.Time) {
-	tier = normalizeConcurrencyTier(tier)
-	if tier == "" {
-		return
-	}
-	a.mu.Lock()
-	a.reserveConcurrencySlotLocked(candidate, tier, now)
-	a.mu.Unlock()
-}
-
 func (a *App) reserveConcurrencySlotIfAvailable(candidate SchedulerAuthCandidate, tier string, now time.Time) bool {
 	tier = normalizeConcurrencyTier(tier)
 	if tier == "" {
@@ -204,16 +194,4 @@ func normalizeConcurrencyTier(value string) string {
 
 func defaultCodexConcurrencyLimits() map[string]int {
 	return map[string]int{"default": 0}
-}
-
-func (a *App) candidateConcurrencyBlocked(candidate SchedulerAuthCandidate, counts map[string]int) (string, bool) {
-	tier, isCodex := candidateCodexConcurrencyTier(candidate)
-	if !isCodex || tier == "" {
-		return "", false
-	}
-	limit := a.codexConcurrencyLimitLocked(tier)
-	if limit <= 0 {
-		return tier, false
-	}
-	return tier, counts[normalizeConcurrencyTier(tier)] >= limit
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -143,5 +144,15 @@ func TestPluginEventManagementRoutes(t *testing.T) {
 	}
 	if app.pluginEventSnapshot(10).Total != 0 {
 		t.Fatal("events were not cleared")
+	}
+}
+
+func TestPluginEventReasonRedactsSecrets(t *testing.T) {
+	reason := truncatePluginEventReason(`{"error":{"token":"secret-token","message":"Authorization: Bearer abc.def"}}`)
+	if strings.Contains(reason, "secret-token") || strings.Contains(reason, "abc.def") {
+		t.Fatalf("reason leaked a secret: %s", reason)
+	}
+	if !strings.Contains(reason, "[REDACTED]") {
+		t.Fatalf("reason was not redacted: %s", reason)
 	}
 }
