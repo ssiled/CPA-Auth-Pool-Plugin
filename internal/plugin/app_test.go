@@ -239,6 +239,70 @@ func TestSchedulerRoundRobinsSamePriorityCandidates(t *testing.T) {
 	}
 }
 
+func TestSchedulerFillFirstUsesFirstCandidateUntilConcurrencyLimit(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-fill-first"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{
+		ID: "pool-a", Name: "Pool A", AuthIDs: []string{"auth-a", "auth-b"}, Models: []string{"gpt-test"},
+		SchedulingStrategy: poolSchedulingFillFirst, Enabled: true,
+	}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "pool-a"}}
+	app.state.CodexConcurrencyLimits = map[string]int{"plus": 2}
+
+	req := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-test",
+		Options:  SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "auth-b", Provider: "codex", Priority: 100, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "auth-a", Provider: "codex", Priority: 100, Attributes: map[string]string{"plan_type": "plus"}},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	for index, wantAuthID := range []string{"auth-a", "auth-a", "auth-b"} {
+		raw, err := app.pickScheduler(rawReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := decodeSchedulerResponse(t, raw)
+		if !resp.Handled || resp.AuthID != wantAuthID {
+			t.Fatalf("response %d = %+v, want %s", index+1, resp, wantAuthID)
+		}
+	}
+
+	app.releaseConcurrencySlot("auth-a")
+	raw, err := app.pickScheduler(rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeSchedulerResponse(t, raw).AuthID; got != "auth-a" {
+		t.Fatalf("selected auth after release = %q, want auth-a", got)
+	}
+}
+
+func TestUpsertPoolNormalizesAndPreservesSchedulingStrategy(t *testing.T) {
+	app := NewApp()
+	app.stateFile = filepath.Join(t.TempDir(), "state.json")
+
+	response := app.upsertPool([]byte(`{"id":"pool-a","name":"Pool A","scheduling_strategy":"fill_first"}`))
+	if response.StatusCode != http.StatusOK || len(app.state.Pools) != 1 || app.state.Pools[0].SchedulingStrategy != poolSchedulingFillFirst {
+		t.Fatalf("fill-first upsert response=%d pools=%#v", response.StatusCode, app.state.Pools)
+	}
+	response = app.upsertPool([]byte(`{"id":"pool-a","name":"Pool A updated"}`))
+	if response.StatusCode != http.StatusOK || app.state.Pools[0].SchedulingStrategy != poolSchedulingFillFirst {
+		t.Fatalf("strategy was not preserved: response=%d pool=%#v", response.StatusCode, app.state.Pools[0])
+	}
+	response = app.upsertPool([]byte(`{"id":"pool-b","name":"Pool B"}`))
+	if response.StatusCode != http.StatusOK || app.state.Pools[1].SchedulingStrategy != poolSchedulingRoundRobin {
+		t.Fatalf("default strategy response=%d pool=%#v", response.StatusCode, app.state.Pools[1])
+	}
+	response = app.upsertPool([]byte(`{"id":"pool-c","name":"Pool C","scheduling_strategy":"random"}`))
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid strategy status = %d, want 400", response.StatusCode)
+	}
+}
+
 func TestSchedulerUsesResolvedAuthIDWithoutCandidateTierMetadata(t *testing.T) {
 	app := NewApp()
 	apiKey := "sk-resolved"

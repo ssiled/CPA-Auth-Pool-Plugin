@@ -1,4 +1,23 @@
-# CPA Auth Pool 0.1.28
+# CPA Auth Pool 0.1.29
+
+This release adds configurable per-pool scheduling.
+
+## Scheduling strategies
+
+- Keep `round-robin` as the backward-compatible default for existing pools.
+- Add `fill-first` to keep using the highest-priority stable account until its per-account concurrency capacity is full.
+- Move to the next account only when the preferred account is full, unavailable, or excluded during retry.
+- Persist and validate `scheduling_strategy` through the pool management API.
+- Expose the configured strategy in plugin status for CPA-Helper-s.
+
+## Failure diagnostics and failover
+
+- Classify model-support, SOCKS proxy, usage-limit, rate-limit and generic upstream failures in plugin events.
+- Include sanitized raw error details, plan type and quota reset timing for CPA-Helper-s monitoring.
+- Put accounts returning HTTP 429 into a persisted cooldown and select another pool member until quota recovery.
+- Prefer upstream `resets_at`, then `resets_in_seconds`, with bounded fallback cooldowns when neither is present.
+
+## Previous 0.1.28 changes
 
 This release adds provider-channel pools without requiring CLIProxyAPI changes.
 

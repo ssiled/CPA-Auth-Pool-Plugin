@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +36,9 @@ const legacyStateFile = "cpa-auth-pool-state.json"
 const (
 	minLogicalPriority = 0
 	maxLogicalPriority = 100
+
+	poolSchedulingRoundRobin = "round-robin"
+	poolSchedulingFillFirst  = "fill-first"
 )
 
 type State struct {
@@ -47,18 +51,20 @@ type State struct {
 	ProxyKeyHashes         []string                   `json:"proxy_key_hashes,omitempty"`
 	CodexConcurrencyLimits map[string]int             `json:"codex_concurrency_limits,omitempty"`
 	ConcurrencySlots       map[string]ConcurrencySlot `json:"concurrency_slots,omitempty"`
+	FailureCooldowns       map[string]FailureCooldown `json:"failure_cooldowns,omitempty"`
 }
 
 type PoolConfig struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	Description     string   `json:"description,omitempty"`
-	AuthIDs         []string `json:"auth_ids"`
-	ResolvedAuthIDs []string `json:"resolved_auth_ids,omitempty"`
-	AccountTypes    []string `json:"account_types,omitempty"`
-	Providers       []string `json:"providers,omitempty"`
-	Models          []string `json:"models,omitempty"`
-	Enabled         bool     `json:"enabled"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	Description        string   `json:"description,omitempty"`
+	AuthIDs            []string `json:"auth_ids"`
+	ResolvedAuthIDs    []string `json:"resolved_auth_ids,omitempty"`
+	AccountTypes       []string `json:"account_types,omitempty"`
+	Providers          []string `json:"providers,omitempty"`
+	Models             []string `json:"models,omitempty"`
+	SchedulingStrategy string   `json:"scheduling_strategy"`
+	Enabled            bool     `json:"enabled"`
 }
 
 type KeyBinding struct {
@@ -73,7 +79,7 @@ func NewApp() *App {
 		state: State{
 			Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{},
 			AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{},
-			ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{},
+			ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{},
 		},
 		schedulerCursors: map[string]int{},
 		events:           make([]PluginEvent, 0, pluginEventCapacity),
@@ -168,6 +174,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	now := time.Now()
+	if a.clearExpiredFailureCooldowns(now) {
+		a.saveRuntimeState()
+	}
 	apiKey := extractAPIKey(req.Options.Headers)
 	apiKeyHash := extractHelperAPIKeyHash(req.Options.Headers)
 	trustedProxyRequest := apiKeyHash != ""
@@ -188,6 +197,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	authTypes := cloneStringMap(a.state.AuthTypes)
 	typePriorities := cloneIntMap(a.state.TypePriorities)
 	authPriorityOverrides := cloneIntMap(a.state.AuthPriorityOverrides)
+	failureCooldowns := cloneFailureCooldownMap(a.state.FailureCooldowns)
 	a.mu.RUnlock()
 	if !ok {
 		if trustedProxyRequest {
@@ -228,6 +238,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	poolMatched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	eligible := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	ruleExcluded := 0
+	cooldownExcluded := 0
 	candidateTiers := map[string]string{}
 	fallbackTier := poolFallbackConcurrencyTier(pool)
 	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
@@ -279,6 +290,10 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		if candidate.Priority < 0 || !schedulerCandidateStatusEligible(candidate.Status) {
 			continue
 		}
+		if failureCooldownActive(failureCooldowns, candidate.ID, now) {
+			cooldownExcluded++
+			continue
+		}
 		if !reserveCandidate(candidate) {
 			continue
 		}
@@ -302,6 +317,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	}
 	if len(eligible) == 0 {
 		reason := schedulerIneligibleReason(poolMatched)
+		if cooldownExcluded == len(poolMatched) {
+			reason = "pool_candidates_cooling_down"
+		}
 		a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", reason, http.StatusServiceUnavailable, now)
 		return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no eligible auth candidates", http.StatusServiceUnavailable)
 	}
@@ -311,6 +329,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		}
 		return eligible[i].Priority > eligible[j].Priority
 	})
+	schedulingStrategy := normalizedPoolSchedulingStrategy(pool.SchedulingStrategy)
 	blockedByConcurrency := false
 	for groupStart := 0; groupStart < len(eligible); {
 		groupEnd := groupStart + 1
@@ -318,8 +337,11 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 			groupEnd++
 		}
 		group := eligible[groupStart:groupEnd]
-		offset := a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, eligible[groupStart].Priority), len(group))
-		pick := a.selectAndReserveConcurrencyCandidate(group, candidateTiers, offset, now)
+		offset := 0
+		if schedulingStrategy == poolSchedulingRoundRobin {
+			offset = a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, eligible[groupStart].Priority), len(group))
+		}
+		pick := a.selectAndReserveConcurrencyCandidate(group, candidateTiers, offset, schedulingStrategy, now)
 		blockedByConcurrency = blockedByConcurrency || pick.Blocked
 		if pick.Selected {
 			selected := pick.Candidate
@@ -421,6 +443,25 @@ func poolCandidateAuthIDs(pool PoolConfig) []string {
 	ids = append(ids, pool.AuthIDs...)
 	ids = append(ids, pool.ResolvedAuthIDs...)
 	return ids
+}
+
+func normalizePoolSchedulingStrategy(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "round-robin", "round_robin", "roundrobin", "rr":
+		return poolSchedulingRoundRobin, true
+	case "fill-first", "fill_first", "fillfirst", "ff":
+		return poolSchedulingFillFirst, true
+	default:
+		return "", false
+	}
+}
+
+func normalizedPoolSchedulingStrategy(value string) string {
+	strategy, ok := normalizePoolSchedulingStrategy(value)
+	if !ok {
+		return poolSchedulingRoundRobin
+	}
+	return strategy
 }
 
 func schedulerCursorKey(poolID, provider, model string, priority int) string {
@@ -775,7 +816,7 @@ func (a *App) load() error {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			a.mu.Lock()
-			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}}
+			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{}}
 			a.mu.Unlock()
 			return nil
 		}
@@ -803,6 +844,13 @@ func (a *App) load() error {
 	if state.AuthPriorityOverrides == nil {
 		state.AuthPriorityOverrides = map[string]int{}
 	}
+	for index := range state.Pools {
+		strategy, ok := normalizePoolSchedulingStrategy(state.Pools[index].SchedulingStrategy)
+		if !ok {
+			return fmt.Errorf("pool %q has invalid scheduling_strategy %q", state.Pools[index].ID, state.Pools[index].SchedulingStrategy)
+		}
+		state.Pools[index].SchedulingStrategy = strategy
+	}
 	if err := validateLogicalPriorities("type_priorities", state.TypePriorities); err != nil {
 		return err
 	}
@@ -821,6 +869,9 @@ func (a *App) load() error {
 	if state.ConcurrencySlots == nil {
 		state.ConcurrencySlots = map[string]ConcurrencySlot{}
 	}
+	if state.FailureCooldowns == nil {
+		state.FailureCooldowns = map[string]FailureCooldown{}
+	}
 	a.mu.Lock()
 	a.state = state
 	a.mu.Unlock()
@@ -838,6 +889,15 @@ func (a *App) save() error {
 		stateFile = defaultStateFile()
 	}
 	return persistState(state, stateFile)
+}
+
+func (a *App) saveRuntimeState() {
+	a.mu.RLock()
+	configured := strings.TrimSpace(a.stateFile) != ""
+	a.mu.RUnlock()
+	if configured {
+		_ = a.save()
+	}
 }
 
 func persistState(state State, stateFile string) error {
@@ -888,6 +948,7 @@ func cloneState(state State) State {
 		ProxyKeyHashes:         append([]string(nil), state.ProxyKeyHashes...),
 		CodexConcurrencyLimits: make(map[string]int, len(state.CodexConcurrencyLimits)),
 		ConcurrencySlots:       make(map[string]ConcurrencySlot, len(state.ConcurrencySlots)),
+		FailureCooldowns:       cloneFailureCooldownMap(state.FailureCooldowns),
 	}
 	for index, pool := range state.Pools {
 		pool.AuthIDs = append([]string(nil), pool.AuthIDs...)

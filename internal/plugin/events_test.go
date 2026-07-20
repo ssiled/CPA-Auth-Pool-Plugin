@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSchedulerEventsRecordSelectedAccount(t *testing.T) {
@@ -101,6 +103,144 @@ func TestUsageEventsRecordFailureAndClear(t *testing.T) {
 	}
 }
 
+func TestUsageEventsClassifyDetailedFailures(t *testing.T) {
+	tests := []struct {
+		name            string
+		statusCode      int
+		body            string
+		wantCode        string
+		wantMessagePart string
+		wantPlan        string
+		wantResetsAt    int64
+		wantResetsIn    int64
+	}{
+		{
+			name:            "model unsupported",
+			statusCode:      http.StatusBadRequest,
+			body:            `{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`,
+			wantCode:        "model_not_supported",
+			wantMessagePart: "gpt-5.6-sol",
+		},
+		{
+			name:            "proxy network unreachable",
+			statusCode:      http.StatusInternalServerError,
+			body:            `Post "https://chatgpt.com/backend-api/codex/responses": socks connect tcp 64.188.8.141:1191->chatgpt.com:443: unknown error network unreachable`,
+			wantCode:        "proxy_network_unreachable",
+			wantMessagePart: "SOCKS proxy",
+		},
+		{
+			name:            "usage limit",
+			statusCode:      http.StatusTooManyRequests,
+			body:            `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1787123950,"eligible_promo":null,"resets_in_seconds":2588673}}`,
+			wantCode:        "usage_limit_reached",
+			wantMessagePart: "usage limit",
+			wantPlan:        "free",
+			wantResetsAt:    1787123950,
+			wantResetsIn:    2588673,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp()
+			app.state.Pools = []PoolConfig{{ID: "002", Name: "plus/team", Enabled: true, ResolvedAuthIDs: []string{"auth-a"}}}
+			app.recordUsageEvent(UsageRecord{
+				Provider: "codex",
+				Model:    "gpt-5.6-sol",
+				AuthID:   "auth-a",
+				Failed:   true,
+				Failure:  UsageFailure{StatusCode: tt.statusCode, Body: tt.body},
+			})
+
+			event := app.pluginEventSnapshot(1).Items[0]
+			if event.ErrorCode != tt.wantCode || !strings.Contains(event.ErrorMessage, tt.wantMessagePart) {
+				t.Fatalf("classified event = %#v", event)
+			}
+			if event.ErrorDetail == "" || event.Model != "gpt-5.6-sol" || event.PlanType != tt.wantPlan || event.ResetsAt != tt.wantResetsAt || event.ResetsInSeconds != tt.wantResetsIn {
+				t.Fatalf("detailed event = %#v", event)
+			}
+		})
+	}
+}
+
+func TestUsageLimitCooldownSwitchesAccountUntilReset(t *testing.T) {
+	app := NewApp()
+	apiKey := "sk-usage-limit-switch"
+	apiKeyHash := hashAPIKey(apiKey)
+	app.state.Pools = []PoolConfig{{
+		ID: "002", Name: "plus/team", Enabled: true, AuthIDs: []string{"auth-a", "auth-b"}, Models: []string{"gpt-5.6-sol"}, SchedulingStrategy: poolSchedulingFillFirst,
+	}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "002"}}
+
+	usageRaw, _ := json.Marshal(UsageRecord{
+		Provider: "codex", Model: "gpt-5.6-sol", AuthID: "auth-a", Failed: true,
+		Failure: UsageFailure{StatusCode: http.StatusTooManyRequests, Body: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}`},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageRaw); err != nil {
+		t.Fatal(err)
+	}
+
+	req := SchedulerPickRequest{
+		Provider: "codex", Model: "gpt-5.6-sol",
+		Options: SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + apiKey}}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "auth-a", Provider: "codex", Priority: 10, Status: "active"},
+			{ID: "auth-b", Provider: "codex", Priority: 10, Status: "active"},
+		},
+	}
+	rawReq, _ := json.Marshal(req)
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope Envelope
+	if err := json.Unmarshal(rawResponse, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var response SchedulerPickResponse
+	if err := json.Unmarshal(envelope.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.AuthID != "auth-b" {
+		t.Fatalf("selected auth = %q, want auth-b while auth-a is cooling down", response.AuthID)
+	}
+	cooldown := app.state.FailureCooldowns[normalizeAuthIDKey("auth-a")]
+	if cooldown.ErrorCode != "usage_limit_reached" || time.Until(cooldown.Until) < 59*time.Minute {
+		t.Fatalf("failure cooldown = %#v", cooldown)
+	}
+
+	successRaw, _ := json.Marshal(UsageRecord{Provider: "codex", Model: "gpt-5.6-sol", AuthID: "auth-a"})
+	if _, err := app.HandleMethod(MethodUsageHandle, successRaw); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := app.state.FailureCooldowns[normalizeAuthIDKey("auth-a")]; exists {
+		t.Fatal("successful usage did not clear the failure cooldown")
+	}
+}
+
+func TestUsageLimitCooldownPersistsAcrossReload(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	app := NewApp()
+	app.stateFile = stateFile
+	usageRaw, _ := json.Marshal(UsageRecord{
+		Provider: "codex", AuthID: "auth-a", Failed: true,
+		Failure: UsageFailure{StatusCode: http.StatusTooManyRequests, Body: `{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageRaw); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewApp()
+	reloaded.stateFile = stateFile
+	if err := reloaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	cooldown := reloaded.state.FailureCooldowns[normalizeAuthIDKey("auth-a")]
+	if cooldown.ErrorCode != "usage_limit_reached" || !cooldown.Until.After(time.Now()) {
+		t.Fatalf("reloaded cooldown = %#v", cooldown)
+	}
+}
+
 func TestPluginEventBufferIsBounded(t *testing.T) {
 	app := NewApp()
 	for index := 0; index < pluginEventCapacity+20; index++ {
@@ -154,8 +294,8 @@ func TestPluginEventManagementRoutes(t *testing.T) {
 }
 
 func TestPluginEventReasonRedactsSecrets(t *testing.T) {
-	reason := truncatePluginEventReason(`{"error":{"token":"secret-token","message":"Authorization: Bearer abc.def"}}`)
-	if strings.Contains(reason, "secret-token") || strings.Contains(reason, "abc.def") {
+	reason := truncatePluginEventReason(`{"error":{"token":"secret-token","message":"Authorization: Bearer abc.def socks5://user:pass@proxy.example.com:1080"}}`)
+	if strings.Contains(reason, "secret-token") || strings.Contains(reason, "abc.def") || strings.Contains(reason, "user:pass") {
 		t.Fatalf("reason leaked a secret: %s", reason)
 	}
 	if !strings.Contains(reason, "[REDACTED]") {

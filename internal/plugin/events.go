@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -14,12 +15,14 @@ const (
 	pluginEventDefaultLimit    = 100
 	pluginEventCandidateLimit  = 25
 	pluginEventReasonLimit     = 320
+	pluginEventDetailLimit     = 2048
 	pluginEventReasonScanLimit = 4096
 )
 
 var (
-	pluginEventBearerPattern = regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._~+/=-]+`)
-	pluginEventSecretPattern = regexp.MustCompile(`(?i)((?:api[_-]?key|token|secret|password|cookie|authorization)\s*[:=]\s*)[^\s,;]+`)
+	pluginEventBearerPattern  = regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._~+/=-]+`)
+	pluginEventSecretPattern  = regexp.MustCompile(`(?i)((?:api[_-]?key|token|secret|password|cookie|authorization)\s*[:=]\s*)[^\s,;]+`)
+	pluginEventURLUserPattern = regexp.MustCompile(`(?i)(https?|socks5h?)://[^/@\s]+@`)
 )
 
 type PluginEvent struct {
@@ -28,6 +31,12 @@ type PluginEvent struct {
 	Phase            string                 `json:"phase"`
 	Status           string                 `json:"status"`
 	Reason           string                 `json:"reason,omitempty"`
+	ErrorCode        string                 `json:"error_code,omitempty"`
+	ErrorMessage     string                 `json:"error_message,omitempty"`
+	ErrorDetail      string                 `json:"error_detail,omitempty"`
+	PlanType         string                 `json:"plan_type,omitempty"`
+	ResetsAt         int64                  `json:"resets_at,omitempty"`
+	ResetsInSeconds  int64                  `json:"resets_in_seconds,omitempty"`
 	HTTPStatus       int                    `json:"http_status,omitempty"`
 	DurationMS       int64                  `json:"duration_ms,omitempty"`
 	Provider         string                 `json:"provider,omitempty"`
@@ -107,30 +116,168 @@ func (a *App) recordSchedulerEventDetails(req SchedulerPickRequest, binding *Key
 	a.recordPluginEvent(event)
 }
 
-func (a *App) recordUsageEvent(record UsageRecord) {
+func (a *App) recordUsageEvent(record UsageRecord) pluginUsageFailure {
+	failure := classifyPluginUsageFailure(record.Failure)
 	authID := strings.TrimSpace(record.AuthID)
 	if authID == "" {
-		return
+		return failure
 	}
 	poolIDs, poolNames := a.poolLabelsForAuthID(authID)
 	if len(poolIDs) == 0 {
-		return
+		return failure
 	}
 	status := "success"
 	if record.Failed {
 		status = "failed"
 	}
 	a.recordPluginEvent(PluginEvent{
-		Timestamp:      time.Now(),
-		Phase:          "completion",
-		Status:         status,
-		Reason:         truncatePluginEventReason(record.Failure.Body),
-		HTTPStatus:     record.Failure.StatusCode,
-		Provider:       strings.TrimSpace(record.Provider),
-		PoolID:         strings.Join(poolIDs, ","),
-		PoolName:       strings.Join(poolNames, ","),
-		SelectedAuthID: authID,
+		Timestamp:       time.Now(),
+		Phase:           "completion",
+		Status:          status,
+		Reason:          truncatePluginEventReason(record.Failure.Body),
+		ErrorCode:       failure.Code,
+		ErrorMessage:    failure.Message,
+		ErrorDetail:     failure.Detail,
+		PlanType:        failure.PlanType,
+		ResetsAt:        failure.ResetsAt,
+		ResetsInSeconds: failure.ResetsInSeconds,
+		HTTPStatus:      record.Failure.StatusCode,
+		Provider:        strings.TrimSpace(record.Provider),
+		Model:           strings.TrimSpace(record.Model),
+		PoolID:          strings.Join(poolIDs, ","),
+		PoolName:        strings.Join(poolNames, ","),
+		SelectedAuthID:  authID,
 	})
+	return failure
+}
+
+type pluginUsageFailure struct {
+	Code            string
+	Message         string
+	Detail          string
+	PlanType        string
+	ResetsAt        int64
+	ResetsInSeconds int64
+}
+
+func classifyPluginUsageFailure(failure UsageFailure) pluginUsageFailure {
+	body := strings.TrimSpace(failure.Body)
+	if failure.StatusCode == 0 && body == "" {
+		return pluginUsageFailure{}
+	}
+	result := pluginUsageFailure{Detail: sanitizePluginEventText(body, pluginEventDetailLimit)}
+	var payload map[string]any
+	if json.Unmarshal([]byte(body), &payload) == nil {
+		if detail, ok := payload["detail"].(string); ok {
+			result.Message = sanitizePluginEventText(detail, pluginEventReasonLimit)
+		}
+		if rawError, ok := payload["error"].(map[string]any); ok {
+			result.Code = normalizePluginErrorCode(pluginEventString(rawError["type"]))
+			result.Message = sanitizePluginEventText(pluginEventString(rawError["message"]), pluginEventReasonLimit)
+			result.PlanType = sanitizePluginEventText(pluginEventString(rawError["plan_type"]), 64)
+			result.ResetsAt = pluginEventInt64(rawError["resets_at"])
+			result.ResetsInSeconds = pluginEventInt64(rawError["resets_in_seconds"])
+		}
+	}
+
+	lowerBody := strings.ToLower(body)
+	lowerMessage := strings.ToLower(result.Message)
+	switch {
+	case strings.Contains(lowerMessage, "model is not supported") ||
+		strings.Contains(lowerMessage, "model is unsupported") ||
+		strings.Contains(lowerBody, "model is not supported"):
+		result.Code = "model_not_supported"
+	case strings.Contains(lowerBody, "socks connect") && strings.Contains(lowerBody, "network unreachable"):
+		result.Code = "proxy_network_unreachable"
+	case strings.Contains(lowerBody, "socks connect") && strings.Contains(lowerBody, "connection refused"):
+		result.Code = "proxy_connection_refused"
+	case strings.Contains(lowerBody, "socks connect") && (strings.Contains(lowerBody, "i/o timeout") || strings.Contains(lowerBody, "deadline exceeded")):
+		result.Code = "proxy_timeout"
+	case strings.Contains(lowerBody, "socks connect") && strings.Contains(lowerBody, "no such host"):
+		result.Code = "proxy_dns_failed"
+	case strings.Contains(lowerBody, "socks connect") && result.Code == "":
+		result.Code = "proxy_connect_failed"
+	}
+
+	if result.Code == "" {
+		switch failure.StatusCode {
+		case http.StatusBadRequest:
+			result.Code = "upstream_bad_request"
+		case http.StatusTooManyRequests:
+			result.Code = "rate_limited"
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			result.Code = "upstream_unavailable"
+		}
+	}
+	if result.Message == "" {
+		result.Message = pluginUsageFailureMessage(result.Code)
+	}
+	return result
+}
+
+func pluginUsageFailureMessage(code string) string {
+	switch code {
+	case "model_not_supported":
+		return "the selected account does not support the requested model"
+	case "proxy_network_unreachable":
+		return "the SOCKS proxy cannot reach the upstream service"
+	case "proxy_connection_refused":
+		return "the SOCKS proxy connection was refused"
+	case "proxy_timeout":
+		return "the SOCKS proxy connection timed out"
+	case "proxy_dns_failed":
+		return "the SOCKS proxy could not resolve the upstream host"
+	case "proxy_connect_failed":
+		return "the SOCKS proxy connection failed"
+	case "usage_limit_reached":
+		return "the account usage limit has been reached"
+	case "rate_limited":
+		return "the upstream service rate limited the request"
+	case "upstream_bad_request":
+		return "the upstream service rejected the request"
+	case "upstream_unavailable":
+		return "the upstream service is unavailable"
+	default:
+		return ""
+	}
+}
+
+func normalizePluginErrorCode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastUnderscore := false
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			builder.WriteRune(char)
+			lastUnderscore = false
+			continue
+		}
+		if builder.Len() > 0 && !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
+func pluginEventString(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func pluginEventInt64(value any) int64 {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	case string:
+		parsed, _ := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func (a *App) poolLabelsForAuthID(authID string) ([]string, []string) {
@@ -240,6 +387,10 @@ func candidateIDs(candidates []SchedulerAuthCandidate, limit int) []string {
 }
 
 func truncatePluginEventReason(value string) string {
+	return sanitizePluginEventText(value, pluginEventReasonLimit)
+}
+
+func sanitizePluginEventText(value string, limit int) string {
 	value = strings.TrimSpace(value)
 	if len(value) > pluginEventReasonScanLimit {
 		value = value[:pluginEventReasonScanLimit]
@@ -252,10 +403,11 @@ func truncatePluginEventReason(value string) string {
 	}
 	value = pluginEventBearerPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = pluginEventSecretPattern.ReplaceAllString(value, `${1}[REDACTED]`)
-	if len(value) <= pluginEventReasonLimit {
+	value = pluginEventURLUserPattern.ReplaceAllString(value, `${1}://[REDACTED]@`)
+	if limit <= 0 || len(value) <= limit {
 		return value
 	}
-	return value[:pluginEventReasonLimit]
+	return value[:limit]
 }
 
 func redactPluginEventValue(value any) any {

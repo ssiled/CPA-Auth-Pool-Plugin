@@ -11,7 +11,7 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.28"
+	Version       = "0.1.29"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"
@@ -136,6 +136,7 @@ type ResponseInterceptResponse struct {
 
 type UsageRecord struct {
 	Provider        string       `json:"Provider,omitempty"`
+	Model           string       `json:"Model,omitempty"`
 	AuthID          string       `json:"AuthID,omitempty"`
 	AuthType        string       `json:"AuthType,omitempty"`
 	Additional      bool         `json:"Additional,omitempty"`

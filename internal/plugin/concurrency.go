@@ -6,7 +6,12 @@ import (
 	"time"
 )
 
-const defaultConcurrencySlotTTL = 10 * time.Minute
+const (
+	defaultConcurrencySlotTTL = 10 * time.Minute
+	defaultRateLimitCooldown  = 2 * time.Minute
+	defaultUsageLimitCooldown = 30 * time.Minute
+	maximumFailureCooldown    = 365 * 24 * time.Hour
+)
 
 type ConcurrencySlot struct {
 	AuthID    string    `json:"auth_id"`
@@ -14,6 +19,14 @@ type ConcurrencySlot struct {
 	Count     int       `json:"count"`
 	StartedAt time.Time `json:"started_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type FailureCooldown struct {
+	AuthID    string    `json:"auth_id"`
+	ErrorCode string    `json:"error_code"`
+	Message   string    `json:"message,omitempty"`
+	Until     time.Time `json:"until"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type concurrencyPickResult struct {
@@ -30,11 +43,92 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return OKEnvelope(map[string]any{})
 	}
-	a.recordUsageEvent(record)
+	failure := a.recordUsageEvent(record)
 	if authID := strings.TrimSpace(record.AuthID); authID != "" && !record.Additional {
 		a.releaseConcurrencySlot(authID)
+		if a.updateFailureCooldown(authID, record, failure, time.Now()) {
+			a.saveRuntimeState()
+		}
 	}
 	return OKEnvelope(map[string]any{})
+}
+
+func (a *App) updateFailureCooldown(authID string, record UsageRecord, failure pluginUsageFailure, now time.Time) bool {
+	authID = strings.TrimSpace(authID)
+	key := normalizeAuthIDKey(authID)
+	if key == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.FailureCooldowns == nil {
+		a.state.FailureCooldowns = map[string]FailureCooldown{}
+	}
+	if !record.Failed {
+		if _, exists := a.state.FailureCooldowns[key]; exists {
+			delete(a.state.FailureCooldowns, key)
+			return true
+		}
+		return false
+	}
+	if record.Failure.StatusCode != 429 && failure.Code != "usage_limit_reached" && failure.Code != "rate_limited" {
+		return false
+	}
+	until := failureCooldownUntil(failure, now)
+	next := FailureCooldown{AuthID: authID, ErrorCode: failure.Code, Message: failure.Message, Until: until, UpdatedAt: now}
+	current, exists := a.state.FailureCooldowns[key]
+	if exists && current.ErrorCode == next.ErrorCode && current.Message == next.Message && current.Until.Equal(next.Until) {
+		return false
+	}
+	a.state.FailureCooldowns[key] = next
+	return true
+}
+
+func failureCooldownUntil(failure pluginUsageFailure, now time.Time) time.Time {
+	if failure.ResetsAt > 0 {
+		until := time.Unix(failure.ResetsAt, 0)
+		if until.After(now) && until.Sub(now) <= maximumFailureCooldown {
+			return until
+		}
+	}
+	if failure.ResetsInSeconds > 0 {
+		seconds := failure.ResetsInSeconds
+		maxSeconds := int64(maximumFailureCooldown / time.Second)
+		if seconds > maxSeconds {
+			seconds = maxSeconds
+		}
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	if failure.Code == "usage_limit_reached" {
+		return now.Add(defaultUsageLimitCooldown)
+	}
+	return now.Add(defaultRateLimitCooldown)
+}
+
+func failureCooldownActive(cooldowns map[string]FailureCooldown, authID string, now time.Time) bool {
+	cooldown, ok := cooldowns[normalizeAuthIDKey(authID)]
+	return ok && cooldown.Until.After(now)
+}
+
+func cloneFailureCooldownMap(values map[string]FailureCooldown) map[string]FailureCooldown {
+	cloned := make(map[string]FailureCooldown, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func (a *App) clearExpiredFailureCooldowns(now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	for key, cooldown := range a.state.FailureCooldowns {
+		if cooldown.Until.IsZero() || !cooldown.Until.After(now) {
+			delete(a.state.FailureCooldowns, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (a *App) clearExpiredConcurrencySlots(now time.Time) {
@@ -63,11 +157,10 @@ func (a *App) releaseConcurrencySlot(authID string) {
 	a.mu.Unlock()
 }
 
-// selectAndReserveConcurrencyCandidate chooses the least-loaded candidate and
-// reserves its slot while holding one lock. The offset only breaks load ties,
-// preserving round-robin fairness without opening a race between selection and
-// reservation under concurrent requests.
-func (a *App) selectAndReserveConcurrencyCandidate(candidates []SchedulerAuthCandidate, tiers map[string]string, offset int, now time.Time) concurrencyPickResult {
+// selectAndReserveConcurrencyCandidate reserves a candidate atomically. Fill-first
+// keeps using the first candidate with capacity; round-robin chooses the least
+// loaded candidate and uses the offset to break load ties.
+func (a *App) selectAndReserveConcurrencyCandidate(candidates []SchedulerAuthCandidate, tiers map[string]string, offset int, strategy string, now time.Time) concurrencyPickResult {
 	if len(candidates) == 0 {
 		return concurrencyPickResult{}
 	}
@@ -85,13 +178,17 @@ func (a *App) selectAndReserveConcurrencyCandidate(candidates []SchedulerAuthCan
 	selectedIndex := -1
 	selectedCount := 0
 	blocked := false
+	fillFirst := normalizedPoolSchedulingStrategy(strategy) == poolSchedulingFillFirst
 	for step := 0; step < len(candidates); step++ {
 		index := (offset + step) % len(candidates)
 		candidate := candidates[index]
 		tier := normalizeConcurrencyTier(tiers[candidate.ID])
 		if tier == "" {
-			// Non-Codex candidates do not consume Codex concurrency slots. Keep
-			// their effective load at zero and use the cursor for fair ties.
+			if fillFirst {
+				selectedIndex = index
+				break
+			}
+			// Non-Codex candidates do not consume Codex concurrency slots.
 			if selectedIndex < 0 || selectedCount > 0 {
 				selectedIndex = index
 				selectedCount = 0
@@ -112,6 +209,11 @@ func (a *App) selectAndReserveConcurrencyCandidate(candidates []SchedulerAuthCan
 		if limit > 0 && count >= limit {
 			blocked = true
 			continue
+		}
+		if fillFirst {
+			selectedIndex = index
+			selectedCount = count
+			break
 		}
 		if selectedIndex < 0 || count < selectedCount {
 			selectedIndex = index

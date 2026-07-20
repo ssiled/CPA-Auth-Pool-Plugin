@@ -116,14 +116,18 @@ func (a *App) snapshot() statusSnapshot {
 	for authID, models := range a.state.AuthModels {
 		authModels[authID] = append([]string(nil), models...)
 	}
+	pools := append([]PoolConfig(nil), a.state.Pools...)
+	for index := range pools {
+		pools[index].SchedulingStrategy = normalizedPoolSchedulingStrategy(pools[index].SchedulingStrategy)
+	}
 	limits := cloneConcurrencyLimits(a.state.CodexConcurrencyLimits)
 	counts := a.codexConcurrencyCountsLocked(now)
 	return statusSnapshot{
 		PluginVersion:          Version,
 		ConcurrencyScope:       "per_account",
-		ConcurrencyStrategy:    "least_loaded_round_robin",
+		ConcurrencyStrategy:    "per_pool",
 		SchedulerPriorities:    true,
-		Pools:                  append([]PoolConfig(nil), a.state.Pools...),
+		Pools:                  pools,
 		Bindings:               bindings,
 		AuthModels:             authModels,
 		AuthTypes:              cloneStringMap(a.state.AuthTypes),
@@ -376,6 +380,11 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
 	pool.Providers = cleanLowerStringList(pool.Providers)
 	pool.Models = cleanModelList(pool.Models)
+	strategy, strategyOK := normalizePoolSchedulingStrategy(pool.SchedulingStrategy)
+	if !strategyOK {
+		return jsonError(http.StatusBadRequest, "invalid_scheduling_strategy", "scheduling_strategy must be round-robin or fill-first")
+	}
+	pool.SchedulingStrategy = strategy
 	if pool.ID == "" || pool.Name == "" {
 		return jsonError(http.StatusBadRequest, "invalid_pool", "id and name are required")
 	}
@@ -384,6 +393,7 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	_ = json.Unmarshal(body, &raw)
 	_, modelsProvided := raw["models"]
 	_, resolvedAuthIDsProvided := raw["resolved_auth_ids"]
+	_, schedulingStrategyProvided := raw["scheduling_strategy"]
 	a.mu.Lock()
 	found := false
 	for i := range a.state.Pools {
@@ -393,6 +403,9 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 			}
 			if !resolvedAuthIDsProvided {
 				pool.ResolvedAuthIDs = append([]string(nil), a.state.Pools[i].ResolvedAuthIDs...)
+			}
+			if !schedulingStrategyProvided {
+				pool.SchedulingStrategy = normalizedPoolSchedulingStrategy(a.state.Pools[i].SchedulingStrategy)
 			}
 			a.state.Pools[i] = pool
 			found = true
