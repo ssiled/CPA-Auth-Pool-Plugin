@@ -1,4 +1,21 @@
-# CPA Auth Pool 0.1.29
+# CPA Auth Pool 0.1.30
+
+This release adds conservative request ownership attribution for CPA-Helper-s usage records.
+
+## Usage attribution
+
+- Include API key hashes and descriptions in authenticated scheduler event diagnostics.
+- Correlate completion events with pending selections only when the auth, model and provider identify one owner.
+- Leave concurrent cross-user completions unattributed when the plugin ABI does not provide a request identifier.
+- Keep pending correlation state bounded and expire it after 30 minutes.
+
+## Validation
+
+- `go test ./...`
+- `go vet ./...`
+- GitHub Actions Linux amd64/arm64 CGO plugin builds
+
+## Previous 0.1.29
 
 This release adds configurable per-pool scheduling.
 

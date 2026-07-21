@@ -11,6 +11,7 @@
 - Before CPA schedules a request, the plugin routes bound Codex/Gemini/Grok/Claude/Antigravity pools to their matching provider so CPA will not fall back to unrelated providers for that key.
 - If a key is bound to a pool but that pool has no matching candidate, the plugin blocks fallback to other pools.
 - Keep a bounded in-memory event log of scheduler decisions and upstream completion status for troubleshooting in CPA-Helper-s.
+- Attach API-key ownership hashes to scheduler events and to completion events only when the in-flight selection is unambiguous.
 - Classify upstream failures with sanitized raw details, quota reset timing and account plan metadata.
 - Temporarily skip accounts that return HTTP 429 and select another pool member until their reported quota reset.
 - API keys without pool bindings keep CPA default scheduling behavior.

@@ -17,16 +17,19 @@ import (
 )
 
 type App struct {
-	mu               sync.RWMutex
-	state            State
-	stateFile        string
-	saveMu           sync.Mutex
-	schedulerMu      sync.Mutex
-	schedulerCursors map[string]int
-	eventsMu         sync.RWMutex
-	events           []PluginEvent
-	eventStart       int
-	nextEventID      uint64
+	mu                sync.RWMutex
+	state             State
+	stateFile         string
+	saveMu            sync.Mutex
+	schedulerMu       sync.Mutex
+	schedulerCursors  map[string]int
+	eventsMu          sync.RWMutex
+	events            []PluginEvent
+	eventStart        int
+	nextEventID       uint64
+	pendingMu         sync.Mutex
+	pendingSelections []pendingPluginSelection
+	nextAttributionID uint64
 }
 
 const helperAPIKeyHashHeader = "X-CPA-Helper-API-Key-Hash"
@@ -68,10 +71,11 @@ type PoolConfig struct {
 }
 
 type KeyBinding struct {
-	APIKeyHash string `json:"api_key_hash"`
-	PoolID     string `json:"pool_id"`
-	UserID     int    `json:"user_id,omitempty"`
-	Username   string `json:"username,omitempty"`
+	APIKeyHash        string `json:"api_key_hash"`
+	APIKeyDescription string `json:"api_key_description,omitempty"`
+	PoolID            string `json:"pool_id"`
+	UserID            int    `json:"user_id,omitempty"`
+	Username          string `json:"username,omitempty"`
 }
 
 func NewApp() *App {
@@ -81,8 +85,9 @@ func NewApp() *App {
 			AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{},
 			ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{},
 		},
-		schedulerCursors: map[string]int{},
-		events:           make([]PluginEvent, 0, pluginEventCapacity),
+		schedulerCursors:  map[string]int{},
+		events:            make([]PluginEvent, 0, pluginEventCapacity),
+		pendingSelections: make([]pendingPluginSelection, 0, pluginPendingSelectionCapacity),
 	}
 }
 

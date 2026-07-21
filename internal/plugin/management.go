@@ -568,7 +568,9 @@ func (a *App) upsertBinding(body []byte) ManagementResponse {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
 	binding.APIKeyHash = strings.TrimSpace(binding.APIKeyHash)
+	binding.APIKeyDescription = strings.TrimSpace(binding.APIKeyDescription)
 	binding.PoolID = strings.TrimSpace(binding.PoolID)
+	binding.Username = strings.TrimSpace(binding.Username)
 	if binding.APIKeyHash == "" || binding.PoolID == "" {
 		return jsonError(http.StatusBadRequest, "invalid_binding", "api_key_hash and pool_id are required")
 	}

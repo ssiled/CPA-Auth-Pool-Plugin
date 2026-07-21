@@ -11,12 +11,14 @@ import (
 )
 
 const (
-	pluginEventCapacity        = 500
-	pluginEventDefaultLimit    = 100
-	pluginEventCandidateLimit  = 25
-	pluginEventReasonLimit     = 320
-	pluginEventDetailLimit     = 2048
-	pluginEventReasonScanLimit = 4096
+	pluginEventCapacity            = 500
+	pluginEventDefaultLimit        = 100
+	pluginEventCandidateLimit      = 25
+	pluginEventReasonLimit         = 320
+	pluginEventDetailLimit         = 2048
+	pluginEventReasonScanLimit     = 4096
+	pluginPendingSelectionCapacity = 500
+	pluginPendingSelectionTTL      = 30 * time.Minute
 )
 
 var (
@@ -26,37 +28,54 @@ var (
 )
 
 type PluginEvent struct {
-	ID               uint64                 `json:"id"`
-	Timestamp        time.Time              `json:"timestamp"`
-	Phase            string                 `json:"phase"`
-	Status           string                 `json:"status"`
-	Reason           string                 `json:"reason,omitempty"`
-	ErrorCode        string                 `json:"error_code,omitempty"`
-	ErrorMessage     string                 `json:"error_message,omitempty"`
-	ErrorDetail      string                 `json:"error_detail,omitempty"`
-	PlanType         string                 `json:"plan_type,omitempty"`
-	ResetsAt         int64                  `json:"resets_at,omitempty"`
-	ResetsInSeconds  int64                  `json:"resets_in_seconds,omitempty"`
-	HTTPStatus       int                    `json:"http_status,omitempty"`
-	DurationMS       int64                  `json:"duration_ms,omitempty"`
-	Provider         string                 `json:"provider,omitempty"`
-	Model            string                 `json:"model,omitempty"`
-	Stream           bool                   `json:"stream,omitempty"`
-	PoolID           string                 `json:"pool_id,omitempty"`
-	PoolName         string                 `json:"pool_name,omitempty"`
-	UserID           int                    `json:"user_id,omitempty"`
-	Username         string                 `json:"username,omitempty"`
-	SelectedAuthID   string                 `json:"selected_auth_id,omitempty"`
-	SelectedPriority *int                   `json:"selected_priority,omitempty"`
-	SelectedState    string                 `json:"selected_state,omitempty"`
-	CandidateCount   int                    `json:"candidate_count"`
-	MatchedCount     int                    `json:"matched_count"`
-	InputCandidates  int                    `json:"input_candidates"`
-	PoolMatched      int                    `json:"pool_matched_candidates"`
-	Eligible         int                    `json:"eligible_candidates"`
-	MatchedAuthIDs   []string               `json:"matched_auth_ids,omitempty"`
-	AccountTypes     []string               `json:"account_types,omitempty"`
-	Candidates       []PluginEventCandidate `json:"candidates,omitempty"`
+	ID                uint64                 `json:"id"`
+	AttributionID     uint64                 `json:"attribution_id,omitempty"`
+	Timestamp         time.Time              `json:"timestamp"`
+	Phase             string                 `json:"phase"`
+	Status            string                 `json:"status"`
+	Reason            string                 `json:"reason,omitempty"`
+	ErrorCode         string                 `json:"error_code,omitempty"`
+	ErrorMessage      string                 `json:"error_message,omitempty"`
+	ErrorDetail       string                 `json:"error_detail,omitempty"`
+	PlanType          string                 `json:"plan_type,omitempty"`
+	ResetsAt          int64                  `json:"resets_at,omitempty"`
+	ResetsInSeconds   int64                  `json:"resets_in_seconds,omitempty"`
+	HTTPStatus        int                    `json:"http_status,omitempty"`
+	DurationMS        int64                  `json:"duration_ms,omitempty"`
+	Provider          string                 `json:"provider,omitempty"`
+	Model             string                 `json:"model,omitempty"`
+	Stream            bool                   `json:"stream,omitempty"`
+	PoolID            string                 `json:"pool_id,omitempty"`
+	PoolName          string                 `json:"pool_name,omitempty"`
+	APIKeyHash        string                 `json:"api_key_hash,omitempty"`
+	APIKeyDescription string                 `json:"api_key_description,omitempty"`
+	UserID            int                    `json:"user_id,omitempty"`
+	Username          string                 `json:"username,omitempty"`
+	SelectedAuthID    string                 `json:"selected_auth_id,omitempty"`
+	SelectedPriority  *int                   `json:"selected_priority,omitempty"`
+	SelectedState     string                 `json:"selected_state,omitempty"`
+	CandidateCount    int                    `json:"candidate_count"`
+	MatchedCount      int                    `json:"matched_count"`
+	InputCandidates   int                    `json:"input_candidates"`
+	PoolMatched       int                    `json:"pool_matched_candidates"`
+	Eligible          int                    `json:"eligible_candidates"`
+	MatchedAuthIDs    []string               `json:"matched_auth_ids,omitempty"`
+	AccountTypes      []string               `json:"account_types,omitempty"`
+	Candidates        []PluginEventCandidate `json:"candidates,omitempty"`
+}
+
+type pendingPluginSelection struct {
+	AttributionID     uint64
+	Timestamp         time.Time
+	APIKeyHash        string
+	APIKeyDescription string
+	UserID            int
+	Username          string
+	PoolID            string
+	PoolName          string
+	SelectedAuthID    string
+	Provider          string
+	Model             string
 }
 
 type PluginEventCandidate struct {
@@ -96,6 +115,8 @@ func (a *App) recordSchedulerEventDetails(req SchedulerPickRequest, binding *Key
 		MatchedAuthIDs:  candidateIDs(poolMatched, pluginEventCandidateLimit),
 	}
 	if binding != nil {
+		event.APIKeyHash = strings.TrimSpace(binding.APIKeyHash)
+		event.APIKeyDescription = strings.TrimSpace(binding.APIKeyDescription)
 		event.UserID = binding.UserID
 		event.Username = strings.TrimSpace(binding.Username)
 	}
@@ -113,6 +134,9 @@ func (a *App) recordSchedulerEventDetails(req SchedulerPickRequest, binding *Key
 	} else if status == "blocked" {
 		event.Candidates = schedulerCandidateEvents(req.Candidates, pluginEventCandidateLimit)
 	}
+	if event.Status == "selected" && event.SelectedAuthID != "" && event.APIKeyHash != "" {
+		event.AttributionID = a.rememberPendingSelection(event)
+	}
 	a.recordPluginEvent(event)
 }
 
@@ -122,16 +146,22 @@ func (a *App) recordUsageEvent(record UsageRecord) pluginUsageFailure {
 	if authID == "" {
 		return failure
 	}
+	now := time.Now()
+	attribution, attributed := a.pendingSelectionAttribution(record, now)
 	poolIDs, poolNames := a.poolLabelsForAuthID(authID)
-	if len(poolIDs) == 0 {
+	if len(poolIDs) == 0 && !attributed {
 		return failure
+	}
+	if len(poolIDs) == 0 {
+		poolIDs = []string{attribution.PoolID}
+		poolNames = []string{attribution.PoolName}
 	}
 	status := "success"
 	if record.Failed {
 		status = "failed"
 	}
-	a.recordPluginEvent(PluginEvent{
-		Timestamp:       time.Now(),
+	event := PluginEvent{
+		Timestamp:       now,
 		Phase:           "completion",
 		Status:          status,
 		Reason:          truncatePluginEventReason(record.Failure.Body),
@@ -147,8 +177,102 @@ func (a *App) recordUsageEvent(record UsageRecord) pluginUsageFailure {
 		PoolID:          strings.Join(poolIDs, ","),
 		PoolName:        strings.Join(poolNames, ","),
 		SelectedAuthID:  authID,
-	})
+	}
+	if attributed {
+		event.AttributionID = attribution.AttributionID
+		event.APIKeyHash = attribution.APIKeyHash
+		event.APIKeyDescription = attribution.APIKeyDescription
+		event.UserID = attribution.UserID
+		event.Username = attribution.Username
+	}
+	a.recordPluginEvent(event)
 	return failure
+}
+
+func (a *App) rememberPendingSelection(event PluginEvent) uint64 {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	a.clearExpiredPendingSelectionsLocked(event.Timestamp)
+	a.nextAttributionID++
+	pending := pendingPluginSelection{
+		AttributionID:     a.nextAttributionID,
+		Timestamp:         event.Timestamp,
+		APIKeyHash:        event.APIKeyHash,
+		APIKeyDescription: event.APIKeyDescription,
+		UserID:            event.UserID,
+		Username:          event.Username,
+		PoolID:            event.PoolID,
+		PoolName:          event.PoolName,
+		SelectedAuthID:    event.SelectedAuthID,
+		Provider:          event.Provider,
+		Model:             event.Model,
+	}
+	if len(a.pendingSelections) >= pluginPendingSelectionCapacity {
+		copy(a.pendingSelections, a.pendingSelections[1:])
+		a.pendingSelections[len(a.pendingSelections)-1] = pending
+		return pending.AttributionID
+	}
+	a.pendingSelections = append(a.pendingSelections, pending)
+	return pending.AttributionID
+}
+
+func (a *App) pendingSelectionAttribution(record UsageRecord, now time.Time) (pendingPluginSelection, bool) {
+	if record.Additional {
+		return pendingPluginSelection{}, false
+	}
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	a.clearExpiredPendingSelectionsLocked(now)
+	candidateIndexes := make([]int, 0, 2)
+	for index, pending := range a.pendingSelections {
+		if normalizeAuthIDKey(pending.SelectedAuthID) != normalizeAuthIDKey(record.AuthID) {
+			continue
+		}
+		if !pluginEventModelMatches(pending.Model, record.Model) || !pluginEventProviderMatches(pending.Provider, record.Provider) {
+			continue
+		}
+		candidateIndexes = append(candidateIndexes, index)
+	}
+	if len(candidateIndexes) == 0 {
+		return pendingPluginSelection{}, false
+	}
+	if len(candidateIndexes) == 1 {
+		index := candidateIndexes[0]
+		pending := a.pendingSelections[index]
+		a.pendingSelections = append(a.pendingSelections[:index], a.pendingSelections[index+1:]...)
+		return pending, true
+	}
+	first := a.pendingSelections[candidateIndexes[0]]
+	for _, index := range candidateIndexes[1:] {
+		if a.pendingSelections[index].APIKeyHash != first.APIKeyHash {
+			return pendingPluginSelection{}, false
+		}
+	}
+	first.AttributionID = 0
+	return first, true
+}
+
+func (a *App) clearExpiredPendingSelectionsLocked(now time.Time) {
+	cutoff := now.Add(-pluginPendingSelectionTTL)
+	kept := a.pendingSelections[:0]
+	for _, pending := range a.pendingSelections {
+		if !pending.Timestamp.Before(cutoff) {
+			kept = append(kept, pending)
+		}
+	}
+	a.pendingSelections = kept
+}
+
+func pluginEventModelMatches(left, right string) bool {
+	left = strings.ToLower(strings.TrimSpace(left))
+	right = strings.ToLower(strings.TrimSpace(right))
+	return left == "" || right == "" || left == right || strings.HasPrefix(left, right+" ") || strings.HasPrefix(right, left+" ")
+}
+
+func pluginEventProviderMatches(left, right string) bool {
+	left = strings.ToLower(strings.TrimSpace(left))
+	right = strings.ToLower(strings.TrimSpace(right))
+	return left == "" || right == "" || left == right
 }
 
 type pluginUsageFailure struct {
@@ -341,11 +465,15 @@ func (a *App) pluginEventSnapshot(limit int) pluginEventResponse {
 
 func (a *App) clearPluginEvents() int {
 	a.eventsMu.Lock()
-	defer a.eventsMu.Unlock()
 	cleared := len(a.events)
 	clear(a.events)
 	a.events = a.events[:0]
 	a.eventStart = 0
+	a.eventsMu.Unlock()
+	a.pendingMu.Lock()
+	clear(a.pendingSelections)
+	a.pendingSelections = a.pendingSelections[:0]
+	a.pendingMu.Unlock()
 	return cleared
 }
 

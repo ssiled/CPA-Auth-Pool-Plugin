@@ -15,7 +15,7 @@ func TestSchedulerEventsRecordSelectedAccount(t *testing.T) {
 	apiKey := "sk-events"
 	apiKeyHash := hashAPIKey(apiKey)
 	app.state.Pools = []PoolConfig{{ID: "002", Name: "plus/team", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-5.5"}}}
-	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, PoolID: "002", UserID: 7, Username: "alice"}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {APIKeyHash: apiKeyHash, APIKeyDescription: "VSCode", PoolID: "002", UserID: 7, Username: "alice"}}
 
 	req := SchedulerPickRequest{
 		Provider: "codex",
@@ -38,11 +38,68 @@ func TestSchedulerEventsRecordSelectedAccount(t *testing.T) {
 	if event.Status != "selected" || event.SelectedAuthID != "auth-a" || event.PoolID != "002" || event.Username != "alice" {
 		t.Fatalf("event = %#v, want selected auth-a for pool 002", event)
 	}
+	if event.APIKeyHash != apiKeyHash || event.APIKeyDescription != "VSCode" || event.AttributionID == 0 {
+		t.Fatalf("event attribution = %#v, want API key ownership metadata", event)
+	}
 	if event.CandidateCount != 1 || event.MatchedCount != 1 || event.InputCandidates != 1 || event.PoolMatched != 1 || event.Eligible != 1 || event.HTTPStatus != http.StatusOK {
 		t.Fatalf("event counts/status = %#v", event)
 	}
 	if event.SelectedPriority == nil || *event.SelectedPriority != 22 {
 		t.Fatalf("selected priority = %v, want 22", event.SelectedPriority)
+	}
+}
+
+func TestUsageCompletionInheritsUniqueSchedulerAttribution(t *testing.T) {
+	app := NewApp()
+	apiKeyHash := hashAPIKey("sk-attributed-completion")
+	app.state.Pools = []PoolConfig{{ID: "pool", Name: "Pool", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-5.6-sol"}}}
+	app.state.KeyBindings = map[string]KeyBinding{apiKeyHash: {
+		APIKeyHash: apiKeyHash, APIKeyDescription: "Desktop", PoolID: "pool", UserID: 8, Username: "bob",
+	}}
+	req := SchedulerPickRequest{
+		Provider: "codex", Model: "gpt-5.6-sol",
+		Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer sk-attributed-completion"}}},
+		Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Provider: "codex", Status: "active"}},
+	}
+	raw, _ := json.Marshal(req)
+	if _, err := app.HandleMethod(MethodSchedulerPick, raw); err != nil {
+		t.Fatal(err)
+	}
+	app.recordUsageEvent(UsageRecord{Provider: "codex", Model: "gpt-5.6-sol medium", AuthID: "auth-a"})
+
+	event := app.pluginEventSnapshot(1).Items[0]
+	if event.Phase != "completion" || event.APIKeyHash != apiKeyHash || event.APIKeyDescription != "Desktop" || event.Username != "bob" || event.AttributionID == 0 {
+		t.Fatalf("completion attribution = %#v", event)
+	}
+}
+
+func TestUsageCompletionDoesNotGuessBetweenConcurrentOwners(t *testing.T) {
+	app := NewApp()
+	app.state.Pools = []PoolConfig{{ID: "pool", Name: "Pool", Enabled: true, AuthIDs: []string{"auth-a"}, Models: []string{"gpt-5.6-sol"}}}
+	for _, owner := range []struct {
+		key      string
+		username string
+	}{
+		{key: "sk-owner-a", username: "alice"},
+		{key: "sk-owner-b", username: "bob"},
+	} {
+		hash := hashAPIKey(owner.key)
+		app.state.KeyBindings[hash] = KeyBinding{APIKeyHash: hash, PoolID: "pool", Username: owner.username}
+		req := SchedulerPickRequest{
+			Provider: "codex", Model: "gpt-5.6-sol",
+			Options:    SchedulerPickOptions{Headers: map[string][]string{"Authorization": {"Bearer " + owner.key}}},
+			Candidates: []SchedulerAuthCandidate{{ID: "auth-a", Provider: "codex", Status: "active"}},
+		}
+		raw, _ := json.Marshal(req)
+		if _, err := app.HandleMethod(MethodSchedulerPick, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	app.recordUsageEvent(UsageRecord{Provider: "codex", Model: "gpt-5.6-sol", AuthID: "auth-a"})
+	event := app.pluginEventSnapshot(1).Items[0]
+	if event.Phase != "completion" || event.APIKeyHash != "" || event.Username != "" || event.AttributionID != 0 {
+		t.Fatalf("ambiguous completion was attributed: %#v", event)
 	}
 }
 

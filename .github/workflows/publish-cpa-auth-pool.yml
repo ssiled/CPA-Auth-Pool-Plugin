@@ -21,6 +21,10 @@ jobs:
             goarch: amd64
             cc: gcc
             packages: gcc
+          - goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu
 
     steps:
       - name: Checkout
