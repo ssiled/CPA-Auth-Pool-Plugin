@@ -1,4 +1,26 @@
-# CPA Auth Pool 0.1.30
+# CPA Auth Pool 0.1.31
+
+This release adds pool-wide concurrency protection and targeted failure failover.
+
+## Scheduling protection
+
+- Add `max_concurrency` per auth pool, with `0` retaining unlimited backward-compatible behavior.
+- Check and reserve pool-wide and per-account slots atomically, then release the exact pool slot from completion attribution.
+- Keep a bounded TTL fallback when the host completion cannot be uniquely linked to a pending selection.
+
+## Targeted cooldowns
+
+- Cache `model_not_supported` by normalized auth ID and model for 30 minutes without blocking other models on that account.
+- Add 15-second account cooldowns for connection refusal/reset, timeout, DNS, TLS, EOF and other network failures.
+- Persist both cooldown types and clear the matching model cache after a successful completion.
+
+## Validation
+
+- `go test ./...`
+- `go vet ./...`
+- GitHub Actions Linux amd64/arm64 CGO plugin builds
+
+## Previous 0.1.30
 
 This release adds conservative request ownership attribution for CPA-Helper-s usage records.
 

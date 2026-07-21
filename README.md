@@ -59,9 +59,9 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 1. Configure CPA URL and Management Key in settings.
 2. Confirm CPA auth accounts are visible in the account inspection pages.
 3. Open `Auth Pools`, create pools, and select accounts for each pool.
-4. Choose `Round robin` to distribute same-priority traffic, or `Fill first` to keep using the first account until its concurrency capacity is full.
+4. Choose `Round robin` or `Fill first`, and optionally set a pool-wide concurrency limit independent of per-account limits.
 5. Open `API Keys`, create or edit a key, and choose a request pool.
-6. Clients keep using the same CPA Base URL and API key; pool scheduling happens inside CPA.
+6. Clients use the CPA-Helper model request URL and their Helper API key; authenticated pool scheduling happens inside CPA.
 
 ## Notes
 
@@ -69,6 +69,7 @@ Restart CPA. CPA-Helper-s uses these management endpoints:
 - Provider routing depends on pool account types. Prefer type-based pools such as `free`, `plus`, `team`, `gemini`, or `grok` when you need strict provider isolation.
 - Bound pools intentionally fail closed: empty or unavailable pools do not fall back to other pools.
 - Fill-first respects logical priority and per-account concurrency limits, then moves to the next stable account ID when the preferred account is full or unavailable.
+- Model-unsupported failures are cached per account and model; network failures place only the affected account into a short cooldown.
 - Back up `plugins/cpa-auth-pool-state.json` because it stores pool definitions and key bindings used by CPA runtime.
 - Versions 0.1.18 and newer migrate a legacy `cpa-auth-pool-state.json` file into `plugins/cpa-auth-pool-state.json` when the new file is missing.
 - Monitoring events are kept only in memory, capped at 500 entries, and disappear when CPA restarts or the buffer is cleared.

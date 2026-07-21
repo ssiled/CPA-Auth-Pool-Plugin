@@ -45,16 +45,18 @@ const (
 )
 
 type State struct {
-	Pools                  []PoolConfig               `json:"pools"`
-	KeyBindings            map[string]KeyBinding      `json:"key_bindings"`
-	AuthModels             map[string][]string        `json:"auth_models,omitempty"`
-	AuthTypes              map[string]string          `json:"auth_types,omitempty"`
-	TypePriorities         map[string]int             `json:"type_priorities,omitempty"`
-	AuthPriorityOverrides  map[string]int             `json:"auth_priority_overrides,omitempty"`
-	ProxyKeyHashes         []string                   `json:"proxy_key_hashes,omitempty"`
-	CodexConcurrencyLimits map[string]int             `json:"codex_concurrency_limits,omitempty"`
-	ConcurrencySlots       map[string]ConcurrencySlot `json:"concurrency_slots,omitempty"`
-	FailureCooldowns       map[string]FailureCooldown `json:"failure_cooldowns,omitempty"`
+	Pools                  []PoolConfig                   `json:"pools"`
+	KeyBindings            map[string]KeyBinding          `json:"key_bindings"`
+	AuthModels             map[string][]string            `json:"auth_models,omitempty"`
+	AuthTypes              map[string]string              `json:"auth_types,omitempty"`
+	TypePriorities         map[string]int                 `json:"type_priorities,omitempty"`
+	AuthPriorityOverrides  map[string]int                 `json:"auth_priority_overrides,omitempty"`
+	ProxyKeyHashes         []string                       `json:"proxy_key_hashes,omitempty"`
+	CodexConcurrencyLimits map[string]int                 `json:"codex_concurrency_limits,omitempty"`
+	ConcurrencySlots       map[string]ConcurrencySlot     `json:"concurrency_slots,omitempty"`
+	PoolConcurrencySlots   map[string]PoolConcurrencySlot `json:"pool_concurrency_slots,omitempty"`
+	FailureCooldowns       map[string]FailureCooldown     `json:"failure_cooldowns,omitempty"`
+	ModelCooldowns         map[string]ModelCooldown       `json:"model_cooldowns,omitempty"`
 }
 
 type PoolConfig struct {
@@ -67,6 +69,7 @@ type PoolConfig struct {
 	Providers          []string `json:"providers,omitempty"`
 	Models             []string `json:"models,omitempty"`
 	SchedulingStrategy string   `json:"scheduling_strategy"`
+	MaxConcurrency     int      `json:"max_concurrency"`
 	Enabled            bool     `json:"enabled"`
 }
 
@@ -83,7 +86,7 @@ func NewApp() *App {
 		state: State{
 			Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{},
 			AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{},
-			ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{},
+			ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, PoolConcurrencySlots: map[string]PoolConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{}, ModelCooldowns: map[string]ModelCooldown{},
 		},
 		schedulerCursors:  map[string]int{},
 		events:            make([]PluginEvent, 0, pluginEventCapacity),
@@ -179,7 +182,9 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	now := time.Now()
-	if a.clearExpiredFailureCooldowns(now) {
+	failureCooldownsCleared := a.clearExpiredFailureCooldowns(now)
+	modelCooldownsCleared := a.clearExpiredModelCooldowns(now)
+	if failureCooldownsCleared || modelCooldownsCleared {
 		a.saveRuntimeState()
 	}
 	apiKey := extractAPIKey(req.Options.Headers)
@@ -203,6 +208,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	typePriorities := cloneIntMap(a.state.TypePriorities)
 	authPriorityOverrides := cloneIntMap(a.state.AuthPriorityOverrides)
 	failureCooldowns := cloneFailureCooldownMap(a.state.FailureCooldowns)
+	modelCooldowns := cloneModelCooldownMap(a.state.ModelCooldowns)
 	a.mu.RUnlock()
 	if !ok {
 		if trustedProxyRequest {
@@ -244,6 +250,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	eligible := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
 	ruleExcluded := 0
 	cooldownExcluded := 0
+	modelCooldownExcluded := 0
 	candidateTiers := map[string]string{}
 	fallbackTier := poolFallbackConcurrencyTier(pool)
 	reserveCandidate := func(candidate SchedulerAuthCandidate) bool {
@@ -299,6 +306,10 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 			cooldownExcluded++
 			continue
 		}
+		if modelCooldownActive(modelCooldowns, candidate.ID, req.Model, now) {
+			modelCooldownExcluded++
+			continue
+		}
 		if !reserveCandidate(candidate) {
 			continue
 		}
@@ -324,6 +335,8 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		reason := schedulerIneligibleReason(poolMatched)
 		if cooldownExcluded == len(poolMatched) {
 			reason = "pool_candidates_cooling_down"
+		} else if modelCooldownExcluded == len(poolMatched) {
+			reason = "model_unsupported_by_pool_candidates"
 		}
 		a.recordSchedulerEventDetails(req, &binding, &pool, poolMatched, eligible, nil, "blocked", reason, http.StatusServiceUnavailable, now)
 		return schedulerBlocked("auth_pool_unavailable", "bound auth pool has no eligible auth candidates", http.StatusServiceUnavailable)
@@ -346,7 +359,7 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		if schedulingStrategy == poolSchedulingRoundRobin {
 			offset = a.nextSchedulerCursor(schedulerCursorKey(pool.ID, req.Provider, req.Model, eligible[groupStart].Priority), len(group))
 		}
-		pick := a.selectAndReserveConcurrencyCandidate(group, candidateTiers, offset, schedulingStrategy, now)
+		pick := a.selectAndReserveConcurrencyCandidate(group, candidateTiers, pool, offset, schedulingStrategy, now)
 		blockedByConcurrency = blockedByConcurrency || pick.Blocked
 		if pick.Selected {
 			selected := pick.Candidate
@@ -821,7 +834,7 @@ func (a *App) load() error {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			a.mu.Lock()
-			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{}}
+			a.state = State{Pools: []PoolConfig{}, KeyBindings: map[string]KeyBinding{}, AuthModels: map[string][]string{}, AuthTypes: map[string]string{}, TypePriorities: map[string]int{}, AuthPriorityOverrides: map[string]int{}, ProxyKeyHashes: []string{}, CodexConcurrencyLimits: defaultCodexConcurrencyLimits(), ConcurrencySlots: map[string]ConcurrencySlot{}, PoolConcurrencySlots: map[string]PoolConcurrencySlot{}, FailureCooldowns: map[string]FailureCooldown{}, ModelCooldowns: map[string]ModelCooldown{}}
 			a.mu.Unlock()
 			return nil
 		}
@@ -855,6 +868,9 @@ func (a *App) load() error {
 			return fmt.Errorf("pool %q has invalid scheduling_strategy %q", state.Pools[index].ID, state.Pools[index].SchedulingStrategy)
 		}
 		state.Pools[index].SchedulingStrategy = strategy
+		if state.Pools[index].MaxConcurrency < 0 || state.Pools[index].MaxConcurrency > 4096 {
+			return fmt.Errorf("pool %q has invalid max_concurrency %d", state.Pools[index].ID, state.Pools[index].MaxConcurrency)
+		}
 	}
 	if err := validateLogicalPriorities("type_priorities", state.TypePriorities); err != nil {
 		return err
@@ -874,8 +890,14 @@ func (a *App) load() error {
 	if state.ConcurrencySlots == nil {
 		state.ConcurrencySlots = map[string]ConcurrencySlot{}
 	}
+	if state.PoolConcurrencySlots == nil {
+		state.PoolConcurrencySlots = map[string]PoolConcurrencySlot{}
+	}
 	if state.FailureCooldowns == nil {
 		state.FailureCooldowns = map[string]FailureCooldown{}
+	}
+	if state.ModelCooldowns == nil {
+		state.ModelCooldowns = map[string]ModelCooldown{}
 	}
 	a.mu.Lock()
 	a.state = state
@@ -953,7 +975,9 @@ func cloneState(state State) State {
 		ProxyKeyHashes:         append([]string(nil), state.ProxyKeyHashes...),
 		CodexConcurrencyLimits: make(map[string]int, len(state.CodexConcurrencyLimits)),
 		ConcurrencySlots:       make(map[string]ConcurrencySlot, len(state.ConcurrencySlots)),
+		PoolConcurrencySlots:   make(map[string]PoolConcurrencySlot, len(state.PoolConcurrencySlots)),
 		FailureCooldowns:       cloneFailureCooldownMap(state.FailureCooldowns),
+		ModelCooldowns:         cloneModelCooldownMap(state.ModelCooldowns),
 	}
 	for index, pool := range state.Pools {
 		pool.AuthIDs = append([]string(nil), pool.AuthIDs...)
@@ -974,6 +998,9 @@ func cloneState(state State) State {
 	}
 	for authID, slot := range state.ConcurrencySlots {
 		cloned.ConcurrencySlots[authID] = slot
+	}
+	for poolID, slot := range state.PoolConcurrencySlots {
+		cloned.PoolConcurrencySlots[poolID] = slot
 	}
 	return cloned
 }

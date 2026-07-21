@@ -11,7 +11,7 @@ const (
 	SchemaVersion = 1
 	PluginID      = "cpa-auth-pool"
 	PluginName    = "cpa-auth-pool"
-	Version       = "0.1.30"
+	Version       = "0.1.31"
 
 	MethodPluginRegister     = "plugin.register"
 	MethodPluginReconfigure  = "plugin.reconfigure"

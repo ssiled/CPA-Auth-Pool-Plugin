@@ -140,17 +140,23 @@ func (a *App) recordSchedulerEventDetails(req SchedulerPickRequest, binding *Key
 	a.recordPluginEvent(event)
 }
 
-func (a *App) recordUsageEvent(record UsageRecord) pluginUsageFailure {
+type pluginUsageResult struct {
+	Failure     pluginUsageFailure
+	Attribution pendingPluginSelection
+	Attributed  bool
+}
+
+func (a *App) recordUsageEvent(record UsageRecord) pluginUsageResult {
 	failure := classifyPluginUsageFailure(record.Failure)
 	authID := strings.TrimSpace(record.AuthID)
 	if authID == "" {
-		return failure
+		return pluginUsageResult{Failure: failure}
 	}
 	now := time.Now()
 	attribution, attributed := a.pendingSelectionAttribution(record, now)
 	poolIDs, poolNames := a.poolLabelsForAuthID(authID)
 	if len(poolIDs) == 0 && !attributed {
-		return failure
+		return pluginUsageResult{Failure: failure, Attribution: attribution, Attributed: attributed}
 	}
 	if len(poolIDs) == 0 {
 		poolIDs = []string{attribution.PoolID}
@@ -186,7 +192,7 @@ func (a *App) recordUsageEvent(record UsageRecord) pluginUsageFailure {
 		event.Username = attribution.Username
 	}
 	a.recordPluginEvent(event)
-	return failure
+	return pluginUsageResult{Failure: failure, Attribution: attribution, Attributed: attributed}
 }
 
 func (a *App) rememberPendingSelection(event PluginEvent) uint64 {
@@ -248,6 +254,8 @@ func (a *App) pendingSelectionAttribution(record UsageRecord, now time.Time) (pe
 			return pendingPluginSelection{}, false
 		}
 	}
+	index := candidateIndexes[0]
+	a.pendingSelections = append(a.pendingSelections[:index], a.pendingSelections[index+1:]...)
 	first.AttributionID = 0
 	return first, true
 }
@@ -309,7 +317,9 @@ func classifyPluginUsageFailure(failure UsageFailure) pluginUsageFailure {
 	switch {
 	case strings.Contains(lowerMessage, "model is not supported") ||
 		strings.Contains(lowerMessage, "model is unsupported") ||
-		strings.Contains(lowerBody, "model is not supported"):
+		strings.Contains(lowerBody, "model is not supported") ||
+		strings.Contains(lowerBody, "does not support the requested model") ||
+		strings.Contains(lowerBody, "does not support this model"):
 		result.Code = "model_not_supported"
 	case strings.Contains(lowerBody, "socks connect") && strings.Contains(lowerBody, "network unreachable"):
 		result.Code = "proxy_network_unreachable"
@@ -321,6 +331,22 @@ func classifyPluginUsageFailure(failure UsageFailure) pluginUsageFailure {
 		result.Code = "proxy_dns_failed"
 	case strings.Contains(lowerBody, "socks connect") && result.Code == "":
 		result.Code = "proxy_connect_failed"
+	case strings.Contains(lowerBody, "network is unreachable") || strings.Contains(lowerBody, "network unreachable"):
+		result.Code = "network_unreachable"
+	case strings.Contains(lowerBody, "connection refused"):
+		result.Code = "connection_refused"
+	case strings.Contains(lowerBody, "connection reset"):
+		result.Code = "connection_reset"
+	case strings.Contains(lowerBody, "i/o timeout") || strings.Contains(lowerBody, "context deadline exceeded") || strings.Contains(lowerBody, "request timeout") || strings.Contains(lowerBody, "timed out"):
+		result.Code = "network_timeout"
+	case strings.Contains(lowerBody, "no such host") || strings.Contains(lowerBody, "name resolution") || strings.Contains(lowerBody, "server misbehaving"):
+		result.Code = "dns_failed"
+	case strings.Contains(lowerBody, "tls handshake") || strings.Contains(lowerBody, "tls:") || strings.Contains(lowerBody, "x509:"):
+		result.Code = "tls_failed"
+	case strings.Contains(lowerBody, "unexpected eof") || strings.TrimSpace(lowerBody) == "eof":
+		result.Code = "network_eof"
+	case strings.Contains(lowerBody, "broken pipe"):
+		result.Code = "network_broken_pipe"
 	}
 
 	if result.Code == "" {
@@ -353,6 +379,8 @@ func pluginUsageFailureMessage(code string) string {
 		return "the SOCKS proxy could not resolve the upstream host"
 	case "proxy_connect_failed":
 		return "the SOCKS proxy connection failed"
+	case "network_unreachable", "connection_refused", "connection_reset", "network_timeout", "dns_failed", "tls_failed", "network_eof", "network_broken_pipe":
+		return "the upstream network request failed"
 	case "usage_limit_reached":
 		return "the account usage limit has been reached"
 	case "rate_limited":

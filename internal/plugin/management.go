@@ -124,7 +124,7 @@ func (a *App) snapshot() statusSnapshot {
 	counts := a.codexConcurrencyCountsLocked(now)
 	return statusSnapshot{
 		PluginVersion:          Version,
-		ConcurrencyScope:       "per_account",
+		ConcurrencyScope:       "per_account_and_pool",
 		ConcurrencyStrategy:    "per_pool",
 		SchedulerPriorities:    true,
 		Pools:                  pools,
@@ -349,8 +349,9 @@ func (a *App) deleteConcurrencySlot(req ManagementRequest) ManagementResponse {
 	a.mu.Lock()
 	removed := 0
 	if all {
-		removed = len(a.state.ConcurrencySlots)
+		removed = len(a.state.ConcurrencySlots) + len(a.state.PoolConcurrencySlots)
 		a.state.ConcurrencySlots = map[string]ConcurrencySlot{}
+		a.state.PoolConcurrencySlots = map[string]PoolConcurrencySlot{}
 	} else {
 		if authID == "" {
 			a.mu.Unlock()
@@ -380,6 +381,9 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	pool.AccountTypes = cleanLowerStringList(pool.AccountTypes)
 	pool.Providers = cleanLowerStringList(pool.Providers)
 	pool.Models = cleanModelList(pool.Models)
+	if pool.MaxConcurrency < 0 || pool.MaxConcurrency > 4096 {
+		return jsonError(http.StatusBadRequest, "invalid_max_concurrency", "max_concurrency must be between 0 and 4096")
+	}
 	strategy, strategyOK := normalizePoolSchedulingStrategy(pool.SchedulingStrategy)
 	if !strategyOK {
 		return jsonError(http.StatusBadRequest, "invalid_scheduling_strategy", "scheduling_strategy must be round-robin or fill-first")
@@ -394,6 +398,7 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 	_, modelsProvided := raw["models"]
 	_, resolvedAuthIDsProvided := raw["resolved_auth_ids"]
 	_, schedulingStrategyProvided := raw["scheduling_strategy"]
+	_, maxConcurrencyProvided := raw["max_concurrency"]
 	a.mu.Lock()
 	found := false
 	for i := range a.state.Pools {
@@ -406,6 +411,9 @@ func (a *App) upsertPool(body []byte) ManagementResponse {
 			}
 			if !schedulingStrategyProvided {
 				pool.SchedulingStrategy = normalizedPoolSchedulingStrategy(a.state.Pools[i].SchedulingStrategy)
+			}
+			if !maxConcurrencyProvided {
+				pool.MaxConcurrency = a.state.Pools[i].MaxConcurrency
 			}
 			a.state.Pools[i] = pool
 			found = true
@@ -435,6 +443,7 @@ func (a *App) deletePool(id string) ManagementResponse {
 		}
 	}
 	a.state.Pools = next
+	delete(a.state.PoolConcurrencySlots, id)
 	for hash, binding := range a.state.KeyBindings {
 		if binding.PoolID == id {
 			delete(a.state.KeyBindings, hash)
